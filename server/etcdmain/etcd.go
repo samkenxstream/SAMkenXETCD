@@ -171,7 +171,7 @@ func startEtcdOrProxyV2(args []string) {
 			if cfg.ec.InitialCluster == cfg.ec.InitialClusterFromName(cfg.ec.Name) {
 				lg.Warn("forgot to set --initial-cluster?")
 			}
-			if types.URLs(cfg.ec.APUrls).String() == embed.DefaultInitialAdvertisePeerURLs {
+			if types.URLs(cfg.ec.AdvertisePeerUrls).String() == embed.DefaultInitialAdvertisePeerURLs {
 				lg.Warn("forgot to set --initial-advertise-peer-urls?")
 			}
 			if cfg.ec.InitialCluster == cfg.ec.InitialClusterFromName(cfg.ec.Name) && len(cfg.ec.Durl) == 0 && len(cfg.ec.DiscoveryCfg.Endpoints) == 0 {
@@ -263,10 +263,8 @@ func checkSupportArch() {
 	}
 	// To add a new platform, check https://github.com/etcd-io/website/blob/main/content/en/docs/${VERSION}/op-guide/supported-platform.md.
 	// The ${VERSION} is the etcd version, e.g. v3.5, v3.6 etc.
-	if runtime.GOARCH == "amd64" ||
-		runtime.GOARCH == "arm64" ||
-		runtime.GOARCH == "ppc64le" ||
-		runtime.GOARCH == "s390x" {
+	switch runtime.GOARCH {
+	case "amd64", "arm64", "ppc64le", "s390x":
 		return
 	}
 	// unsupported arch only configured via environment variable

@@ -26,6 +26,7 @@ import (
 
 	"go.etcd.io/etcd/api/v3/version"
 	"go.etcd.io/etcd/client/pkg/v3/logutil"
+	"go.etcd.io/etcd/client/pkg/v3/tlsutil"
 	"go.etcd.io/etcd/pkg/v3/flags"
 	cconfig "go.etcd.io/etcd/server/v3/config"
 	"go.etcd.io/etcd/server/v3/embed"
@@ -114,7 +115,11 @@ func newConfig() *config {
 	)
 	fs.Var(
 		flags.NewUniqueURLsWithExceptions(embed.DefaultListenClientURLs, ""), "listen-client-urls",
-		"List of URLs to listen on for client traffic.",
+		"List of URLs to listen on for client grpc traffic and http as long as --listen-client-http-urls is not specified.",
+	)
+	fs.Var(
+		flags.NewUniqueURLsWithExceptions("", ""), "listen-client-http-urls",
+		"List of URLs to listen on for http only client traffic. Enabling this flag removes http services from --listen-client-urls.",
 	)
 	fs.Var(
 		flags.NewUniqueURLsWithExceptions("", ""),
@@ -215,6 +220,8 @@ func newConfig() *config {
 	fs.StringVar(&cfg.ec.PeerTLSInfo.AllowedHostname, "peer-cert-allowed-hostname", "", "Allowed TLS hostname for inter peer authentication.")
 	fs.Var(flags.NewStringsValue(""), "cipher-suites", "Comma-separated list of supported TLS cipher suites between client/server and peers (empty will be auto-populated by Go).")
 	fs.BoolVar(&cfg.ec.PeerTLSInfo.SkipClientSANVerify, "experimental-peer-skip-client-san-verification", false, "Skip verification of SAN field in client certificate for peer connections.")
+	fs.StringVar(&cfg.ec.TlsMinVersion, "tls-min-version", string(tlsutil.TLSVersion12), "Minimum TLS version supported by etcd. Possible values: TLS1.2, TLS1.3.")
+	fs.StringVar(&cfg.ec.TlsMaxVersion, "tls-max-version", string(tlsutil.TLSVersionDefault), "Maximum TLS version supported by etcd. Possible values: TLS1.2, TLS1.3 (empty defers to Go).")
 
 	fs.Var(
 		flags.NewUniqueURLsWithExceptions("*", "*"),
@@ -303,7 +310,7 @@ func (cfg *config) parse(arguments []string) error {
 		os.Exit(2)
 	}
 	if len(cfg.cf.flagSet.Args()) != 0 {
-		return fmt.Errorf("'%s' is not a valid flag", cfg.cf.flagSet.Arg(0))
+		return fmt.Errorf("%q is not a valid flag", cfg.cf.flagSet.Arg(0))
 	}
 
 	if cfg.printVersion {
@@ -380,10 +387,11 @@ func (cfg *config) configFromCmdLine() error {
 		lg.Info(fmt.Sprintf("raft-write-timeout increased to minimum value: %v", rafthttp.DefaultConnWriteTimeout))
 	}
 
-	cfg.ec.LPUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "listen-peer-urls")
-	cfg.ec.APUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "initial-advertise-peer-urls")
-	cfg.ec.LCUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "listen-client-urls")
-	cfg.ec.ACUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "advertise-client-urls")
+	cfg.ec.ListenPeerUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "listen-peer-urls")
+	cfg.ec.AdvertisePeerUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "initial-advertise-peer-urls")
+	cfg.ec.ListenClientUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "listen-client-urls")
+	cfg.ec.ListenClientHttpUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "listen-client-http-urls")
+	cfg.ec.AdvertiseClientUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "advertise-client-urls")
 	cfg.ec.ListenMetricsUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "listen-metrics-urls")
 
 	cfg.ec.DiscoveryCfg.Endpoints = flags.UniqueStringsFromFlag(cfg.cf.flagSet, "discovery-endpoints")
@@ -404,7 +412,7 @@ func (cfg *config) configFromCmdLine() error {
 	// disable default advertise-client-urls if lcurls is set
 	missingAC := flags.IsSet(cfg.cf.flagSet, "listen-client-urls") && !flags.IsSet(cfg.cf.flagSet, "advertise-client-urls")
 	if missingAC {
-		cfg.ec.ACUrls = nil
+		cfg.ec.AdvertiseClientUrls = nil
 	}
 
 	// disable default initial-cluster if discovery is set
