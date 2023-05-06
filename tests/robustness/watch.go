@@ -40,8 +40,8 @@ func collectClusterWatchEvents(ctx context.Context, t *testing.T, clus *e2e.Etcd
 		c, err := clientv3.New(clientv3.Config{
 			Endpoints:            member.EndpointsGRPC(),
 			Logger:               zap.NewNop(),
-			DialKeepAliveTime:    1 * time.Millisecond,
-			DialKeepAliveTimeout: 5 * time.Millisecond,
+			DialKeepAliveTime:    10 * time.Second,
+			DialKeepAliveTimeout: 100 * time.Millisecond,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -269,7 +269,7 @@ func patchOperationBasedOnWatchEvents(operations []porcupine.Operation, watchEve
 
 	for _, op := range operations {
 		request := op.Input.(model.EtcdRequest)
-		resp := op.Output.(model.EtcdResponse)
+		resp := op.Output.(model.EtcdNonDeterministicResponse)
 		if resp.Err == nil || op.Call > lastObservedOperation.Call || request.Type != model.Txn {
 			// Cannot patch those requests.
 			newOperations = append(newOperations, op)
@@ -279,8 +279,8 @@ func patchOperationBasedOnWatchEvents(operations []porcupine.Operation, watchEve
 		if event != nil {
 			// Set revision and time based on watchEvent.
 			op.Return = event.Time.UnixNano()
-			op.Output = model.EtcdResponse{
-				Revision:      event.Revision,
+			op.Output = model.EtcdNonDeterministicResponse{
+				EtcdResponse:  model.EtcdResponse{Revision: event.Revision},
 				ResultUnknown: true,
 			}
 			newOperations = append(newOperations, op)
