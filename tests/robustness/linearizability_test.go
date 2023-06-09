@@ -19,96 +19,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anishathalye/porcupine"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 	"golang.org/x/sync/errgroup"
 
 	"go.etcd.io/etcd/api/v3/version"
 	"go.etcd.io/etcd/tests/v3/framework/e2e"
+	"go.etcd.io/etcd/tests/v3/robustness/identity"
 	"go.etcd.io/etcd/tests/v3/robustness/model"
-)
-
-const (
-	// waitBetweenFailpointTriggers
-	waitBetweenFailpointTriggers = time.Second
-)
-
-var (
-	LowTraffic = trafficConfig{
-		name:            "LowTraffic",
-		minimalQPS:      100,
-		maximalQPS:      200,
-		clientCount:     8,
-		requestProgress: false,
-		traffic: etcdTraffic{
-			keyCount:     10,
-			leaseTTL:     DefaultLeaseTTL,
-			largePutSize: 32769,
-			writeChoices: []choiceWeight{
-				{choice: string(Put), weight: 45},
-				{choice: string(LargePut), weight: 5},
-				{choice: string(Delete), weight: 10},
-				{choice: string(MultiOpTxn), weight: 10},
-				{choice: string(PutWithLease), weight: 10},
-				{choice: string(LeaseRevoke), weight: 10},
-				{choice: string(CompareAndSet), weight: 10},
-			},
-		},
-	}
-	HighTraffic = trafficConfig{
-		name:            "HighTraffic",
-		minimalQPS:      200,
-		maximalQPS:      1000,
-		clientCount:     12,
-		requestProgress: false,
-		traffic: etcdTraffic{
-			keyCount:     10,
-			largePutSize: 32769,
-			leaseTTL:     DefaultLeaseTTL,
-			writeChoices: []choiceWeight{
-				{choice: string(Put), weight: 85},
-				{choice: string(MultiOpTxn), weight: 10},
-				{choice: string(LargePut), weight: 5},
-			},
-		},
-	}
-	KubernetesTraffic = trafficConfig{
-		name:        "Kubernetes",
-		minimalQPS:  200,
-		maximalQPS:  1000,
-		clientCount: 12,
-		traffic: kubernetesTraffic{
-			averageKeyCount: 5,
-			resource:        "pods",
-			namespace:       "default",
-			writeChoices: []choiceWeight{
-				{choice: string(KubernetesUpdate), weight: 75},
-				{choice: string(KubernetesDelete), weight: 15},
-				{choice: string(KubernetesCreate), weight: 10},
-			},
-		},
-	}
-	ReqProgTraffic = trafficConfig{
-		name:            "RequestProgressTraffic",
-		minimalQPS:      200,
-		maximalQPS:      1000,
-		clientCount:     12,
-		requestProgress: true,
-		traffic: etcdTraffic{
-			keyCount:     10,
-			largePutSize: 8196,
-			leaseTTL:     DefaultLeaseTTL,
-			writeChoices: []choiceWeight{
-				{choice: string(Put), weight: 95},
-				{choice: string(LargePut), weight: 5},
-			},
-		},
-	}
-	defaultTraffic = LowTraffic
-	trafficList    = []trafficConfig{
-		LowTraffic, HighTraffic, KubernetesTraffic,
-	}
+	"go.etcd.io/etcd/tests/v3/robustness/traffic"
 )
 
 func TestRobustness(t *testing.T) {
@@ -117,19 +36,13 @@ func TestRobustness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed checking etcd version binary, binary: %q, err: %v", e2e.BinPath.Etcd, err)
 	}
-	type scenario struct {
-		name      string
-		failpoint Failpoint
-		config    e2e.EtcdProcessClusterConfig
-		traffic   *trafficConfig
-	}
-	scenarios := []scenario{}
-	for _, traffic := range trafficList {
-		scenarios = append(scenarios, scenario{
-			name:      "ClusterOfSize1/" + traffic.name,
+	scenarios := []testScenario{}
+	for _, traffic := range []traffic.Config{traffic.LowTraffic, traffic.HighTraffic, traffic.KubernetesTraffic} {
+		scenarios = append(scenarios, testScenario{
+			name:      "ClusterOfSize1/" + traffic.Name,
 			failpoint: RandomFailpoint,
-			traffic:   &traffic,
-			config: *e2e.NewConfig(
+			traffic:   traffic,
+			cluster: *e2e.NewConfig(
 				e2e.WithClusterSize(1),
 				e2e.WithSnapshotCount(100),
 				e2e.WithGoFailEnabled(true),
@@ -148,51 +61,56 @@ func TestRobustness(t *testing.T) {
 		if !v.LessThan(version.V3_6) {
 			clusterOfSize3Options = append(clusterOfSize3Options, e2e.WithSnapshotCatchUpEntries(100))
 		}
-		scenarios = append(scenarios, scenario{
-			name:      "ClusterOfSize3/" + traffic.name,
+		scenarios = append(scenarios, testScenario{
+			name:      "ClusterOfSize3/" + traffic.Name,
 			failpoint: RandomFailpoint,
-			traffic:   &traffic,
-			config:    *e2e.NewConfig(clusterOfSize3Options...),
+			traffic:   traffic,
+			watch: watchConfig{
+				expectUniqueRevision: traffic.Traffic.ExpectUniqueRevision(),
+			},
+			cluster: *e2e.NewConfig(clusterOfSize3Options...),
 		})
 	}
-	scenarios = append(scenarios, scenario{
+	scenarios = append(scenarios, testScenario{
 		name:      "Issue14370",
 		failpoint: RaftBeforeSavePanic,
-		config: *e2e.NewConfig(
+		cluster: *e2e.NewConfig(
 			e2e.WithClusterSize(1),
 			e2e.WithGoFailEnabled(true),
 		),
 	})
-	scenarios = append(scenarios, scenario{
+	scenarios = append(scenarios, testScenario{
 		name:      "Issue14685",
 		failpoint: DefragBeforeCopyPanic,
-		config: *e2e.NewConfig(
+		cluster: *e2e.NewConfig(
 			e2e.WithClusterSize(1),
 			e2e.WithGoFailEnabled(true),
 		),
 	})
-	scenarios = append(scenarios, scenario{
+	scenarios = append(scenarios, testScenario{
 		name:      "Issue13766",
 		failpoint: KillFailpoint,
-		traffic:   &HighTraffic,
-		config: *e2e.NewConfig(
+		traffic:   traffic.HighTraffic,
+		cluster: *e2e.NewConfig(
 			e2e.WithSnapshotCount(100),
 		),
 	})
-	scenarios = append(scenarios, scenario{
+	scenarios = append(scenarios, testScenario{
 		name:      "Issue15220",
 		failpoint: RandomFailpoint,
-		traffic:   &ReqProgTraffic,
-		config: *e2e.NewConfig(
+		watch: watchConfig{
+			requestProgress: true,
+		},
+		cluster: *e2e.NewConfig(
 			e2e.WithClusterSize(1),
 		),
 	})
 	if v.Compare(version.V3_5) >= 0 {
-		scenarios = append(scenarios, scenario{
+		scenarios = append(scenarios, testScenario{
 			name:      "Issue15271",
 			failpoint: BlackholeUntilSnapshot,
-			traffic:   &HighTraffic,
-			config: *e2e.NewConfig(
+			traffic:   traffic.HighTraffic,
+			cluster: *e2e.NewConfig(
 				e2e.WithSnapshotCount(100),
 				e2e.WithPeerProxy(true),
 				e2e.WithIsPeerTLS(true),
@@ -200,28 +118,31 @@ func TestRobustness(t *testing.T) {
 		})
 	}
 	for _, scenario := range scenarios {
-		if scenario.traffic == nil {
-			scenario.traffic = &defaultTraffic
+		if scenario.traffic == (traffic.Config{}) {
+			scenario.traffic = traffic.LowTraffic
 		}
 
 		t.Run(scenario.name, func(t *testing.T) {
 			lg := zaptest.NewLogger(t)
-			scenario.config.Logger = lg
+			scenario.cluster.Logger = lg
 			ctx := context.Background()
-			testRobustness(ctx, t, lg, scenario.config, scenario.traffic, FailpointConfig{
-				failpoint:           scenario.failpoint,
-				count:               1,
-				retries:             3,
-				waitBetweenTriggers: waitBetweenFailpointTriggers,
-			})
+			testRobustness(ctx, t, lg, scenario)
 		})
 	}
 }
 
-func testRobustness(ctx context.Context, t *testing.T, lg *zap.Logger, config e2e.EtcdProcessClusterConfig, traffic *trafficConfig, failpoint FailpointConfig) {
+type testScenario struct {
+	name      string
+	failpoint Failpoint
+	cluster   e2e.EtcdProcessClusterConfig
+	traffic   traffic.Config
+	watch     watchConfig
+}
+
+func testRobustness(ctx context.Context, t *testing.T, lg *zap.Logger, s testScenario) {
 	r := report{lg: lg}
 	var err error
-	r.clus, err = e2e.NewEtcdProcessCluster(ctx, t, e2e.WithConfig(&config))
+	r.clus, err = e2e.NewEtcdProcessCluster(ctx, t, e2e.WithConfig(&s.cluster))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,50 +155,50 @@ func testRobustness(ctx context.Context, t *testing.T, lg *zap.Logger, config e2
 	defer func() {
 		r.Report(t, panicked)
 	}()
-	r.operations, r.responses = runScenario(ctx, t, lg, r.clus, *traffic, failpoint)
+	r.clientReports = s.run(ctx, t, lg, r.clus)
 	forcestopCluster(r.clus)
 
 	watchProgressNotifyEnabled := r.clus.Cfg.WatchProcessNotifyInterval != 0
-	validateWatchResponses(t, r.clus, r.responses, traffic.requestProgress || watchProgressNotifyEnabled)
-
-	r.events = watchEvents(r.responses)
-	validateEventsMatch(t, r.events)
-
-	r.patchedOperations = patchOperationBasedOnWatchEvents(r.operations, longestHistory(r.events))
-	r.visualizeHistory = model.ValidateOperationHistoryAndReturnVisualize(t, lg, r.patchedOperations)
+	validateGotAtLeastOneProgressNotify(t, r.clientReports, s.watch.requestProgress || watchProgressNotifyEnabled)
+	r.visualizeHistory = validateCorrectness(t, lg, s.watch, r.clientReports)
 
 	panicked = false
 }
 
-func runScenario(ctx context.Context, t *testing.T, lg *zap.Logger, clus *e2e.EtcdProcessCluster, traffic trafficConfig, failpoint FailpointConfig) (operations []porcupine.Operation, responses [][]watchResponse) {
+func (s testScenario) run(ctx context.Context, t *testing.T, lg *zap.Logger, clus *e2e.EtcdProcessCluster) (reports []traffic.ClientReport) {
 	g := errgroup.Group{}
+	var operationReport, watchReport []traffic.ClientReport
 	finishTraffic := make(chan struct{})
 
+	// using baseTime time-measuring operation to get monotonic clock reading
+	// see https://github.com/golang/go/blob/master/src/time/time.go#L17
+	baseTime := time.Now()
+	ids := identity.NewIdProvider()
 	g.Go(func() error {
 		defer close(finishTraffic)
-		injectFailpoints(ctx, t, lg, clus, failpoint)
+		injectFailpoints(ctx, t, lg, clus, s.failpoint)
 		time.Sleep(time.Second)
 		return nil
 	})
 	maxRevisionChan := make(chan int64, 1)
 	g.Go(func() error {
 		defer close(maxRevisionChan)
-		operations = simulateTraffic(ctx, t, lg, clus, traffic, finishTraffic)
-		maxRevisionChan <- operationsMaxRevision(operations)
+		operationReport = traffic.SimulateTraffic(ctx, t, lg, clus, s.traffic, finishTraffic, baseTime, ids)
+		maxRevisionChan <- operationsMaxRevision(operationReport)
 		return nil
 	})
 	g.Go(func() error {
-		responses = collectClusterWatchEvents(ctx, t, clus, maxRevisionChan, traffic.requestProgress)
+		watchReport = collectClusterWatchEvents(ctx, t, clus, maxRevisionChan, s.watch, baseTime, ids)
 		return nil
 	})
 	g.Wait()
-	return operations, responses
+	return append(operationReport, watchReport...)
 }
 
-func operationsMaxRevision(operations []porcupine.Operation) int64 {
+func operationsMaxRevision(reports []traffic.ClientReport) int64 {
 	var maxRevision int64
-	for _, op := range operations {
-		revision := op.Output.(model.EtcdNonDeterministicResponse).Revision
+	for _, r := range reports {
+		revision := r.OperationHistory.MaxRevision()
 		if revision > maxRevision {
 			maxRevision = revision
 		}
@@ -291,4 +212,10 @@ func forcestopCluster(clus *e2e.EtcdProcessCluster) error {
 		member.Kill()
 	}
 	return clus.ConcurrentStop()
+}
+
+func validateCorrectness(t *testing.T, lg *zap.Logger, cfg watchConfig, reports []traffic.ClientReport) (visualize func(basepath string)) {
+	validateWatchCorrectness(t, cfg, reports)
+	operations := operationsFromClientReports(reports)
+	return model.ValidateOperationHistoryAndReturnVisualize(t, lg, operations)
 }

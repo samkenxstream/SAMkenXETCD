@@ -42,11 +42,15 @@ func describeEtcdResponse(request EtcdRequest, response EtcdResponse) string {
 func describeEtcdRequest(request EtcdRequest) string {
 	switch request.Type {
 	case Txn:
-		describeOperations := describeEtcdOperations(request.Txn.Ops)
-		if len(request.Txn.Conds) != 0 {
-			return fmt.Sprintf("if(%s).then(%s)", describeEtcdConditions(request.Txn.Conds), describeOperations)
+		onSuccess := describeEtcdOperations(request.Txn.OperationsOnSuccess)
+		if len(request.Txn.Conditions) != 0 {
+			if len(request.Txn.OperationsOnFailure) == 0 {
+				return fmt.Sprintf("if(%s).then(%s)", describeEtcdConditions(request.Txn.Conditions), onSuccess)
+			}
+			onFailure := describeEtcdOperations(request.Txn.OperationsOnFailure)
+			return fmt.Sprintf("if(%s).then(%s).else(%s)", describeEtcdConditions(request.Txn.Conditions), onSuccess, onFailure)
 		}
-		return describeOperations
+		return onSuccess
 	case LeaseGrant:
 		return fmt.Sprintf("leaseGrant(%d)", request.LeaseGrant.LeaseID)
 	case LeaseRevoke:
@@ -75,20 +79,32 @@ func describeEtcdOperations(ops []EtcdOperation) string {
 }
 
 func describeTxnResponse(request *TxnRequest, response *TxnResponse) string {
-	if response.TxnResult {
-		return fmt.Sprintf("txn failed")
+	respDescription := make([]string, len(response.Results))
+	for i, result := range response.Results {
+		if response.Failure {
+			respDescription[i] = describeEtcdOperationResponse(request.OperationsOnFailure[i], result)
+		} else {
+			respDescription[i] = describeEtcdOperationResponse(request.OperationsOnSuccess[i], result)
+		}
 	}
-	respDescription := make([]string, len(response.OpsResult))
-	for i := range response.OpsResult {
-		respDescription[i] = describeEtcdOperationResponse(request.Ops[i], response.OpsResult[i])
+	description := strings.Join(respDescription, ", ")
+	if len(request.Conditions) == 0 {
+		return description
 	}
-	return strings.Join(respDescription, ", ")
+	if response.Failure {
+		return fmt.Sprintf("failure(%s)", description)
+	} else {
+		return fmt.Sprintf("success(%s)", description)
+	}
 }
 
 func describeEtcdOperation(op EtcdOperation) string {
 	switch op.Type {
 	case Range:
 		if op.WithPrefix {
+			if op.Limit != 0 {
+				return fmt.Sprintf("range(%q, limit=%d)", op.Key, op.Limit)
+			}
 			return fmt.Sprintf("range(%q)", op.Key)
 		}
 		return fmt.Sprintf("get(%q)", op.Key)
@@ -112,7 +128,7 @@ func describeEtcdOperationResponse(req EtcdOperation, resp EtcdOperationResult) 
 			for i, kv := range resp.KVs {
 				kvs[i] = describeValueOrHash(kv.Value)
 			}
-			return fmt.Sprintf("[%s]", strings.Join(kvs, ","))
+			return fmt.Sprintf("[%s], count: %d", strings.Join(kvs, ","), resp.Count)
 		} else {
 			if len(resp.KVs) == 0 {
 				return "nil"

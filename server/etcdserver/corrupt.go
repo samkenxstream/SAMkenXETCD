@@ -86,7 +86,6 @@ func (h hasherAdapter) TriggerCorruptAlarm(memberID types.ID) {
 // before serving any peer/client traffic. Only mismatch when hashes
 // are different at requested revision, with same compact revision.
 func (cm *corruptionChecker) InitialCheck() error {
-
 	cm.lg.Info(
 		"starting initial corruption check",
 		zap.String("local-member-id", cm.hasher.MemberId().String()),
@@ -260,7 +259,7 @@ func (cm *corruptionChecker) PeriodicCheck() error {
 // have different hashes.
 //
 // We might miss opportunity to perform the check if the compaction is still
-// ongoing on one of the members or it was unresponsive. In such situation the
+// ongoing on one of the members, or it was unresponsive. In such situation the
 // method still passes without raising alarm.
 func (cm *corruptionChecker) CompactHashCheck() {
 	cm.lg.Info("starting compact hash check",
@@ -269,12 +268,13 @@ func (cm *corruptionChecker) CompactHashCheck() {
 	)
 	hashes := cm.uncheckedRevisions()
 	// Assume that revisions are ordered from largest to smallest
-	for _, hash := range hashes {
+	for i, hash := range hashes {
 		peers := cm.hasher.PeerHashByRev(hash.Revision)
 		if len(peers) == 0 {
 			continue
 		}
 		if cm.checkPeerHashes(hash, peers) {
+			cm.lg.Info("finished compaction hash check", zap.Int("number-of-hashes-checked", i+1))
 			return
 		}
 	}

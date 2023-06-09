@@ -78,14 +78,14 @@ func initState(request EtcdRequest, response EtcdResponse) etcdState {
 	}
 	switch request.Type {
 	case Txn:
-		if response.Txn.TxnResult {
+		if response.Txn.Failure {
 			return state
 		}
-		if len(request.Txn.Ops) != len(response.Txn.OpsResult) {
+		if len(request.Txn.OperationsOnSuccess) != len(response.Txn.Results) {
 			panic(fmt.Sprintf("Incorrect request %s, response %+v", describeEtcdRequest(request), describeEtcdResponse(request, response)))
 		}
-		for i, op := range request.Txn.Ops {
-			opResp := response.Txn.OpsResult[i]
+		for i, op := range request.Txn.OperationsOnSuccess {
+			opResp := response.Txn.Results[i]
 			switch op.Type {
 			case Range:
 				for _, kv := range opResp.KVs {
@@ -127,33 +127,40 @@ func (s etcdState) step(request EtcdRequest) (etcdState, EtcdResponse) {
 	s.KeyValues = newKVs
 	switch request.Type {
 	case Txn:
-		success := true
-		for _, cond := range request.Txn.Conds {
+		failure := false
+		for _, cond := range request.Txn.Conditions {
 			if val := s.KeyValues[cond.Key]; val.ModRevision != cond.ExpectedRevision {
-				success = false
+				failure = true
 				break
 			}
 		}
-		if !success {
-			return s, EtcdResponse{Revision: s.Revision, Txn: &TxnResponse{TxnResult: true}}
+		operations := request.Txn.OperationsOnSuccess
+		if failure {
+			operations = request.Txn.OperationsOnFailure
 		}
-		opResp := make([]EtcdOperationResult, len(request.Txn.Ops))
+		opResp := make([]EtcdOperationResult, len(operations))
 		increaseRevision := false
-		for i, op := range request.Txn.Ops {
+		for i, op := range operations {
 			switch op.Type {
 			case Range:
 				opResp[i] = EtcdOperationResult{
 					KVs: []KeyValue{},
 				}
 				if op.WithPrefix {
+					var count int64
 					for k, v := range s.KeyValues {
 						if strings.HasPrefix(k, op.Key) {
 							opResp[i].KVs = append(opResp[i].KVs, KeyValue{Key: k, ValueRevision: v})
+							count += 1
 						}
 					}
 					sort.Slice(opResp[i].KVs, func(j, k int) bool {
 						return opResp[i].KVs[j].Key < opResp[i].KVs[k].Key
 					})
+					if op.Limit != 0 && count > op.Limit {
+						opResp[i].KVs = opResp[i].KVs[:op.Limit]
+					}
+					opResp[i].Count = count
 				} else {
 					value, ok := s.KeyValues[op.Key]
 					if ok {
@@ -161,6 +168,7 @@ func (s etcdState) step(request EtcdRequest) (etcdState, EtcdResponse) {
 							Key:           op.Key,
 							ValueRevision: value,
 						})
+						opResp[i].Count = 1
 					}
 				}
 			case Put:
@@ -191,7 +199,7 @@ func (s etcdState) step(request EtcdRequest) (etcdState, EtcdResponse) {
 		if increaseRevision {
 			s.Revision += 1
 		}
-		return s, EtcdResponse{Txn: &TxnResponse{OpsResult: opResp}, Revision: s.Revision}
+		return s, EtcdResponse{Txn: &TxnResponse{Failure: failure, Results: opResp}, Revision: s.Revision}
 	case LeaseGrant:
 		lease := EtcdLease{
 			LeaseID: request.LeaseGrant.LeaseID,
@@ -257,8 +265,9 @@ type EtcdRequest struct {
 }
 
 type TxnRequest struct {
-	Conds []EtcdCondition
-	Ops   []EtcdOperation
+	Conditions          []EtcdCondition
+	OperationsOnSuccess []EtcdOperation
+	OperationsOnFailure []EtcdOperation
 }
 
 type EtcdCondition struct {
@@ -270,6 +279,7 @@ type EtcdOperation struct {
 	Type       OperationType
 	Key        string
 	WithPrefix bool
+	Limit      int64
 	Value      ValueOrHash
 	LeaseID    int64
 }
@@ -291,8 +301,8 @@ type EtcdResponse struct {
 }
 
 type TxnResponse struct {
-	TxnResult bool
-	OpsResult []EtcdOperationResult
+	Failure bool
+	Results []EtcdOperationResult
 }
 
 type LeaseGrantReponse struct {
@@ -303,6 +313,7 @@ type DefragmentResponse struct{}
 
 type EtcdOperationResult struct {
 	KVs     []KeyValue
+	Count   int64
 	Deleted int64
 }
 

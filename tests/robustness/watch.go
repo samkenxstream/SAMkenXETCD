@@ -22,39 +22,32 @@ import (
 
 	"github.com/anishathalye/porcupine"
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
-	"go.uber.org/zap"
 
-	"go.etcd.io/etcd/api/v3/mvccpb"
-	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/tests/v3/framework/e2e"
+	"go.etcd.io/etcd/tests/v3/robustness/identity"
 	"go.etcd.io/etcd/tests/v3/robustness/model"
+	"go.etcd.io/etcd/tests/v3/robustness/traffic"
 )
 
-func collectClusterWatchEvents(ctx context.Context, t *testing.T, clus *e2e.EtcdProcessCluster, maxRevisionChan <-chan int64, requestProgress bool) [][]watchResponse {
+func collectClusterWatchEvents(ctx context.Context, t *testing.T, clus *e2e.EtcdProcessCluster, maxRevisionChan <-chan int64, cfg watchConfig, baseTime time.Time, ids identity.Provider) []traffic.ClientReport {
 	mux := sync.Mutex{}
 	var wg sync.WaitGroup
-	memberResponses := make([][]watchResponse, len(clus.Procs))
+	reports := make([]traffic.ClientReport, len(clus.Procs))
 	memberMaxRevisionChans := make([]chan int64, len(clus.Procs))
 	for i, member := range clus.Procs {
-		c, err := clientv3.New(clientv3.Config{
-			Endpoints:            member.EndpointsGRPC(),
-			Logger:               zap.NewNop(),
-			DialKeepAliveTime:    10 * time.Second,
-			DialKeepAliveTimeout: 100 * time.Millisecond,
-		})
+		c, err := traffic.NewClient(member.EndpointsGRPC(), ids, baseTime)
 		if err != nil {
 			t.Fatal(err)
 		}
-		memberChan := make(chan int64, 1)
-		memberMaxRevisionChans[i] = memberChan
+		memberMaxRevisionChan := make(chan int64, 1)
+		memberMaxRevisionChans[i] = memberMaxRevisionChan
 		wg.Add(1)
-		go func(i int, c *clientv3.Client) {
+		go func(i int, c *traffic.RecordingClient) {
 			defer wg.Done()
 			defer c.Close()
-			responses := watchMember(ctx, t, c, memberChan, requestProgress)
+			watchUntilRevision(ctx, t, c, memberMaxRevisionChan, cfg)
 			mux.Lock()
-			memberResponses[i] = responses
+			reports[i] = c.Report()
 			mux.Unlock()
 		}(i, c)
 	}
@@ -67,27 +60,31 @@ func collectClusterWatchEvents(ctx context.Context, t *testing.T, clus *e2e.Etcd
 		}
 	}()
 	wg.Wait()
-	return memberResponses
+	return reports
 }
 
-// watchMember collects all responses until context is cancelled, it has observed revision provided via maxRevisionChan or maxRevisionChan was closed.
-func watchMember(ctx context.Context, t *testing.T, c *clientv3.Client, maxRevisionChan <-chan int64, requestProgress bool) (resps []watchResponse) {
+type watchConfig struct {
+	requestProgress      bool
+	expectUniqueRevision bool
+}
+
+// watchUntilRevision watches all changes until context is cancelled, it has observed revision provided via maxRevisionChan or maxRevisionChan was closed.
+func watchUntilRevision(ctx context.Context, t *testing.T, c *traffic.RecordingClient, maxRevisionChan <-chan int64, cfg watchConfig) {
 	var maxRevision int64 = 0
 	var lastRevision int64 = 0
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	watch := c.Watch(ctx, "", clientv3.WithPrefix(), clientv3.WithRev(1), clientv3.WithProgressNotify())
+	watch := c.Watch(ctx, "", 1, true, true)
 	for {
 		select {
 		case <-ctx.Done():
-			revision := watchResponsesMaxRevision(resps)
 			if maxRevision == 0 {
 				t.Errorf("Client didn't collect all events, max revision not set")
 			}
-			if revision < maxRevision {
-				t.Errorf("Client didn't collect all events, revision got %d, expected: %d", revision, maxRevision)
+			if lastRevision < maxRevision {
+				t.Errorf("Client didn't collect all events, revision got %d, expected: %d", lastRevision, maxRevision)
 			}
-			return resps
+			return
 		case revision, ok := <-maxRevisionChan:
 			if ok {
 				maxRevision = revision
@@ -101,15 +98,12 @@ func watchMember(ctx context.Context, t *testing.T, c *clientv3.Client, maxRevis
 				}
 			}
 		case resp := <-watch:
-			if requestProgress {
+			if cfg.requestProgress {
 				c.RequestProgress(ctx)
 			}
-			if resp.Err() == nil {
-				resps = append(resps, watchResponse{resp, time.Now()})
-			} else if !resp.Canceled {
+			if resp.Err() != nil && !resp.Canceled {
 				t.Errorf("Watch stream received error, err %v", resp.Err())
 			}
-			// Assumes that we track all events as we watch all keys.
 			if len(resp.Events) > 0 {
 				lastRevision = resp.Events[len(resp.Events)-1].Kv.ModRevision
 			}
@@ -120,151 +114,149 @@ func watchMember(ctx context.Context, t *testing.T, c *clientv3.Client, maxRevis
 	}
 }
 
-func watchResponsesMaxRevision(responses []watchResponse) int64 {
+func watchResponsesMaxRevision(responses []traffic.WatchResponse) int64 {
 	var maxRevision int64
 	for _, response := range responses {
 		for _, event := range response.Events {
-			if event.Kv.ModRevision > maxRevision {
-				maxRevision = event.Kv.ModRevision
+			if event.Revision > maxRevision {
+				maxRevision = event.Revision
 			}
 		}
 	}
 	return maxRevision
 }
 
-func validateWatchResponses(t *testing.T, clus *e2e.EtcdProcessCluster, responses [][]watchResponse, expectProgressNotify bool) {
-	for i, member := range clus.Procs {
-		validateMemberWatchResponses(t, member.Config().Name, responses[i], expectProgressNotify)
+func validateWatchCorrectness(t *testing.T, cfg watchConfig, reports []traffic.ClientReport) {
+	// Validate etcd watch properties defined in https://etcd.io/docs/v3.6/learning/api_guarantees/#watch-apis
+	for _, r := range reports {
+		validateOrdered(t, r)
+		validateUnique(t, cfg.expectUniqueRevision, r)
+		validateAtomic(t, r)
+		// TODO: Validate Resumable
+		validateBookmarkable(t, r)
 	}
+	validateEventsMatch(t, reports)
+	// Expects that longest history encompasses all events.
+	// TODO: Use combined events from all histories instead of the longest history.
+	// TODO: Validate that each watch report is reliable, not only the longest one.
+	validateReliable(t, longestEventHistory(reports))
 }
 
-func validateMemberWatchResponses(t *testing.T, memberId string, responses []watchResponse, expectProgressNotify bool) {
-	// Validate watch is correctly configured to ensure proper testing
-	validateGotAtLeastOneProgressNotify(t, memberId, responses, expectProgressNotify)
-
-	// Validate etcd watch properties defined in https://etcd.io/docs/v3.6/learning/api/#watch-streams
-	validateOrderedAndReliable(t, memberId, responses)
-	validateUnique(t, memberId, responses)
-	validateAtomic(t, memberId, responses)
-	// Validate kubernetes usage of watch
-	validateRenewable(t, memberId, responses)
-}
-
-func validateGotAtLeastOneProgressNotify(t *testing.T, memberId string, responses []watchResponse, expectProgressNotify bool) {
+func validateGotAtLeastOneProgressNotify(t *testing.T, reports []traffic.ClientReport, expectProgressNotify bool) {
 	var gotProgressNotify = false
-	var lastHeadRevision int64 = 1
-	for _, resp := range responses {
-		if resp.IsProgressNotify() && resp.Header.Revision == lastHeadRevision {
-			gotProgressNotify = true
+	for _, r := range reports {
+		var lastHeadRevision int64 = 1
+		for _, resp := range r.Watch {
+			if resp.IsProgressNotify && resp.Revision == lastHeadRevision {
+				gotProgressNotify = true
+				break
+			}
+			lastHeadRevision = resp.Revision
+		}
+		if gotProgressNotify {
 			break
 		}
-		lastHeadRevision = resp.Header.Revision
 	}
 	if gotProgressNotify != expectProgressNotify {
-		t.Errorf("Progress notify does not match, expect: %v, got: %v, member: %q", expectProgressNotify, gotProgressNotify, memberId)
+		t.Errorf("Progress notify does not match, expect: %v, got: %v", expectProgressNotify, gotProgressNotify)
 	}
 }
 
-func validateRenewable(t *testing.T, memberId string, responses []watchResponse) {
+func validateBookmarkable(t *testing.T, report traffic.ClientReport) {
 	var lastProgressNotifyRevision int64 = 0
-	for _, resp := range responses {
+	for _, resp := range report.Watch {
 		for _, event := range resp.Events {
-			if event.Kv.ModRevision <= lastProgressNotifyRevision {
-				t.Errorf("Broke watch guarantee: Renewable - watch can renewed using revision in last progress notification; Progress notification guarantees that previous events have been already delivered, eventRevision: %d, progressNotifyRevision: %d, member: %q", event.Kv.ModRevision, lastProgressNotifyRevision, memberId)
+			if event.Revision <= lastProgressNotifyRevision {
+				t.Errorf("Broke watch guarantee: Renewable - watch can renewed using revision in last progress notification; Progress notification guarantees that previous events have been already delivered, eventRevision: %d, progressNotifyRevision: %d", event.Revision, lastProgressNotifyRevision)
 			}
 		}
-		if resp.IsProgressNotify() {
-			lastProgressNotifyRevision = resp.Header.Revision
+		if resp.IsProgressNotify {
+			lastProgressNotifyRevision = resp.Revision
 		}
 	}
 }
 
-func validateOrderedAndReliable(t *testing.T, memberId string, responses []watchResponse) {
+func validateOrdered(t *testing.T, report traffic.ClientReport) {
 	var lastEventRevision int64 = 1
-	for _, resp := range responses {
+	for _, resp := range report.Watch {
 		for _, event := range resp.Events {
-			if event.Kv.ModRevision != lastEventRevision && event.Kv.ModRevision != lastEventRevision+1 {
-				if event.Kv.ModRevision < lastEventRevision {
-					t.Errorf("Broke watch guarantee: Ordered - events are ordered by revision; an event will never appear on a watch if it precedes an event in time that has already been posted, lastRevision: %d, currentRevision: %d, member: %q", lastEventRevision, event.Kv.ModRevision, memberId)
-				} else {
-					t.Errorf("Broke watch guarantee: Reliable - a sequence of events will never drop any subsequence of events; if there are events ordered in time as a < b < c, then if the watch receives events a and c, it is guaranteed to receive b, lastRevision: %d, currentRevision: %d, member: %q", lastEventRevision, event.Kv.ModRevision, memberId)
-				}
+			if event.Revision < lastEventRevision {
+				t.Errorf("Broke watch guarantee: Ordered - events are ordered by revision; an event will never appear on a watch if it precedes an event in time that has already been posted, lastRevision: %d, currentRevision: %d, client: %d", lastEventRevision, event.Revision, report.ClientId)
 			}
-			lastEventRevision = event.Kv.ModRevision
+			lastEventRevision = event.Revision
 		}
 	}
 }
 
-func validateUnique(t *testing.T, memberId string, responses []watchResponse) {
-	type revisionKey struct {
-		revision int64
-		key      string
-	}
-	uniqueOperations := map[revisionKey]struct{}{}
-	for _, resp := range responses {
+func validateUnique(t *testing.T, expectUniqueRevision bool, report traffic.ClientReport) {
+	uniqueOperations := map[interface{}]struct{}{}
+
+	for _, resp := range report.Watch {
 		for _, event := range resp.Events {
-			rk := revisionKey{key: string(event.Kv.Key), revision: event.Kv.ModRevision}
-			if _, found := uniqueOperations[rk]; found {
-				t.Errorf("Broke watch guarantee: Unique - an event will never appear on a watch twice, key: %q, revision: %d, member: %q", rk.key, rk.revision, memberId)
+			var key interface{}
+			if expectUniqueRevision {
+				key = event.Revision
+			} else {
+				key = struct {
+					revision int64
+					key      string
+				}{event.Revision, event.Op.Key}
 			}
-			uniqueOperations[rk] = struct{}{}
+
+			if _, found := uniqueOperations[key]; found {
+				t.Errorf("Broke watch guarantee: Unique - an event will never appear on a watch twice, key: %q, revision: %d, client: %d", event.Op.Key, event.Revision, report.ClientId)
+			}
+			uniqueOperations[key] = struct{}{}
 		}
 	}
 }
 
-func validateAtomic(t *testing.T, memberId string, responses []watchResponse) {
+func validateAtomic(t *testing.T, report traffic.ClientReport) {
 	var lastEventRevision int64 = 1
-	for _, resp := range responses {
+	for _, resp := range report.Watch {
 		if len(resp.Events) > 0 {
-			if resp.Events[0].Kv.ModRevision == lastEventRevision {
-				t.Errorf("Broke watch guarantee: Atomic - a list of events is guaranteed to encompass complete revisions; updates in the same revision over multiple keys will not be split over several lists of events, previousListEventRevision: %d, currentListEventRevision: %d, member: %q", lastEventRevision, resp.Events[0].Kv.ModRevision, memberId)
+			if resp.Events[0].Revision == lastEventRevision {
+				t.Errorf("Broke watch guarantee: Atomic - a list of events is guaranteed to encompass complete revisions; updates in the same revision over multiple keys will not be split over several lists of events, previousListEventRevision: %d, currentListEventRevision: %d, client: %d", lastEventRevision, resp.Events[0].Revision, report.ClientId)
 			}
-			lastEventRevision = resp.Events[len(resp.Events)-1].Kv.ModRevision
+			lastEventRevision = resp.Events[len(resp.Events)-1].Revision
 		}
 	}
 }
 
-func toWatchEvents(responses []watchResponse) (events []watchEvent) {
+func validateReliable(t *testing.T, events []traffic.TimedWatchEvent) {
+	var lastEventRevision int64 = 1
+	for _, event := range events {
+		if event.Revision > lastEventRevision && event.Revision != lastEventRevision+1 {
+			t.Errorf("Broke watch guarantee: Reliable - a sequence of events will never drop any subsequence of events; if there are events ordered in time as a < b < c, then if the watch receives events a and c, it is guaranteed to receive b, missing revisions from range: %d-%d", lastEventRevision, event.Revision)
+		}
+		lastEventRevision = event.Revision
+	}
+}
+
+func toWatchEvents(responses []traffic.WatchResponse) (events []traffic.TimedWatchEvent) {
 	for _, resp := range responses {
 		for _, event := range resp.Events {
-			var op model.OperationType
-			switch event.Type {
-			case mvccpb.PUT:
-				op = model.Put
-			case mvccpb.DELETE:
-				op = model.Delete
-			}
-			events = append(events, watchEvent{
-				Time:     resp.time,
-				Revision: event.Kv.ModRevision,
-				Op: model.EtcdOperation{
-					Type:  op,
-					Key:   string(event.Kv.Key),
-					Value: model.ToValueOrHash(string(event.Kv.Value)),
-				},
+			events = append(events, traffic.TimedWatchEvent{
+				Time:       resp.Time,
+				WatchEvent: event,
 			})
 		}
 	}
 	return events
 }
 
-type watchResponse struct {
-	clientv3.WatchResponse
-	time time.Time
-}
-
-type watchEvent struct {
-	Op       model.EtcdOperation
-	Revision int64
-	Time     time.Time
-}
-
-func patchOperationBasedOnWatchEvents(operations []porcupine.Operation, watchEvents []watchEvent) []porcupine.Operation {
-	newOperations := make([]porcupine.Operation, 0, len(operations))
-	persisted := map[model.EtcdOperation]watchEvent{}
-	for _, op := range watchEvents {
-		persisted[op.Op] = op
+func operationsFromClientReports(reports []traffic.ClientReport) []porcupine.Operation {
+	operations := []porcupine.Operation{}
+	persisted := map[model.EtcdOperation]traffic.TimedWatchEvent{}
+	for _, r := range reports {
+		operations = append(operations, r.OperationHistory.Operations()...)
+		for _, resp := range r.Watch {
+			for _, event := range resp.Events {
+				persisted[event.Op] = traffic.TimedWatchEvent{Time: resp.Time, WatchEvent: event}
+			}
+		}
 	}
+	newOperations := make([]porcupine.Operation, 0, len(operations))
 	lastObservedOperation := lastOperationObservedInWatch(operations, persisted)
 
 	for _, op := range operations {
@@ -278,7 +270,7 @@ func patchOperationBasedOnWatchEvents(operations []porcupine.Operation, watchEve
 		event := matchWatchEvent(request.Txn, persisted)
 		if event != nil {
 			// Set revision and time based on watchEvent.
-			op.Return = event.Time.UnixNano()
+			op.Return = event.Time.Nanoseconds()
 			op.Output = model.EtcdNonDeterministicResponse{
 				EtcdResponse:  model.EtcdResponse{Revision: event.Revision},
 				ResultUnknown: true,
@@ -296,7 +288,7 @@ func patchOperationBasedOnWatchEvents(operations []porcupine.Operation, watchEve
 	return newOperations
 }
 
-func lastOperationObservedInWatch(operations []porcupine.Operation, watchEvents map[model.EtcdOperation]watchEvent) porcupine.Operation {
+func lastOperationObservedInWatch(operations []porcupine.Operation, watchEvents map[model.EtcdOperation]traffic.TimedWatchEvent) porcupine.Operation {
 	var maxCallTime int64
 	var lastOperation porcupine.Operation
 	for _, op := range operations {
@@ -313,8 +305,8 @@ func lastOperationObservedInWatch(operations []porcupine.Operation, watchEvents 
 	return lastOperation
 }
 
-func matchWatchEvent(request *model.TxnRequest, watchEvents map[model.EtcdOperation]watchEvent) *watchEvent {
-	for _, etcdOp := range request.Ops {
+func matchWatchEvent(request *model.TxnRequest, watchEvents map[model.EtcdOperation]traffic.TimedWatchEvent) *traffic.TimedWatchEvent {
+	for _, etcdOp := range append(request.OperationsOnSuccess, request.OperationsOnFailure...) {
 		if etcdOp.Type == model.Put {
 			// Remove LeaseID which is not exposed in watch.
 			event, ok := watchEvents[model.EtcdOperation{
@@ -331,7 +323,7 @@ func matchWatchEvent(request *model.TxnRequest, watchEvents map[model.EtcdOperat
 }
 
 func hasNonUniqueWriteOperation(request *model.TxnRequest) bool {
-	for _, etcdOp := range request.Ops {
+	for _, etcdOp := range request.OperationsOnSuccess {
 		if etcdOp.Type == model.Put || etcdOp.Type == model.Delete {
 			return true
 		}
@@ -340,7 +332,7 @@ func hasNonUniqueWriteOperation(request *model.TxnRequest) bool {
 }
 
 func hasUniqueWriteOperation(request *model.TxnRequest) bool {
-	for _, etcdOp := range request.Ops {
+	for _, etcdOp := range request.OperationsOnSuccess {
 		if etcdOp.Type == model.Put {
 			return true
 		}
@@ -348,31 +340,40 @@ func hasUniqueWriteOperation(request *model.TxnRequest) bool {
 	return false
 }
 
-func watchEvents(responses [][]watchResponse) [][]watchEvent {
-	ops := make([][]watchEvent, len(responses))
-	for i, resps := range responses {
-		ops[i] = toWatchEvents(resps)
+func validateEventsMatch(t *testing.T, reports []traffic.ClientReport) {
+	type revisionKey struct {
+		revision int64
+		key      string
 	}
-	return ops
-}
-
-func validateEventsMatch(t *testing.T, histories [][]watchEvent) {
-	longestHistory := longestHistory(histories)
-	for i := 0; i < len(histories); i++ {
-		length := len(histories[i])
-		// We compare prefix of watch events, as we are not guaranteed to collect all events from each node.
-		if diff := cmp.Diff(longestHistory[:length], histories[i][:length], cmpopts.IgnoreFields(watchEvent{}, "Time")); diff != "" {
-			t.Error("Events in watches do not match")
+	type eventClientId struct {
+		traffic.WatchEvent
+		ClientId int
+	}
+	revisionKeyToEvent := map[revisionKey]eventClientId{}
+	for _, r := range reports {
+		for _, resp := range r.Watch {
+			for _, event := range resp.Events {
+				rk := revisionKey{key: event.Op.Key, revision: event.Revision}
+				if prev, found := revisionKeyToEvent[rk]; found {
+					if prev.WatchEvent != event {
+						t.Errorf("Events between clients %d and %d don't match, key: %q, revision: %d, diff: %s", prev.ClientId, r.ClientId, rk.key, rk.revision, cmp.Diff(prev, event))
+					}
+				}
+				revisionKeyToEvent[rk] = eventClientId{ClientId: r.ClientId, WatchEvent: event}
+			}
 		}
 	}
 }
 
-func longestHistory(histories [][]watchEvent) []watchEvent {
+func longestEventHistory(report []traffic.ClientReport) []traffic.TimedWatchEvent {
 	longestIndex := 0
-	for i, history := range histories {
-		if len(history) > len(histories[longestIndex]) {
+	longestEventCount := 0
+	for i, r := range report {
+		rEventCount := r.WatchEventCount()
+		if rEventCount > longestEventCount {
 			longestIndex = i
+			longestEventCount = rEventCount
 		}
 	}
-	return histories[longestIndex]
+	return toWatchEvents(report[longestIndex].Watch)
 }
