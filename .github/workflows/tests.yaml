@@ -3,11 +3,12 @@ name: Tests
 on: [push, pull_request]
 permissions: read-all
 jobs:
-  goversion:
-    uses: ./.github/workflows/go-version.yaml
   test:
     runs-on: ubuntu-latest
-    needs: goversion
+    container: golang:1.20-bullseye
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -15,14 +16,17 @@ jobs:
           - linux-amd64-integration-1-cpu
           - linux-amd64-integration-2-cpu
           - linux-amd64-integration-4-cpu
-          - linux-amd64-unit-4-cpu-race
+          - linux-amd64-unit-4-cpu
           - linux-386-unit-1-cpu
     steps:
-      - uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab # v3.5.2
-      - uses: actions/setup-go@fac708d6674e30b6ba41289acaab6d4b75aa0753 # v4.0.1
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      # https://github.com/actions/checkout/issues/1169
+      - run: git config --system --add safe.directory '*'
+      - id: goversion
+        run: echo "goversion=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@93397bea11091df50f3d7e59dc26a7711a8bcfbe # v4.1.0
         with:
-          go-version: ${{ needs.goversion.outputs.goversion }}
-      - run: date
+          go-version: ${{ steps.goversion.outputs.goversion }}
       - env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -33,16 +37,19 @@ jobs:
           export JUNIT_REPORT_DIR=$(realpath ${TARGET})
           case "${TARGET}" in
             linux-amd64-integration-1-cpu)
+              make gofail-enable
               GOOS=linux GOARCH=amd64 CPU=1 make test-integration
               ;;
             linux-amd64-integration-2-cpu)
+              make gofail-enable
               GOOS=linux GOARCH=amd64 CPU=2 make test-integration
               ;;
             linux-amd64-integration-4-cpu)
+              make gofail-enable
               GOOS=linux GOARCH=amd64 CPU=4 make test-integration
               ;;
-            linux-amd64-unit-4-cpu-race)
-              GOOS=linux GOARCH=amd64 CPU=4 RACE=true GO_TEST_FLAGS='-p=2' make test-unit
+            linux-amd64-unit-4-cpu)
+              GOOS=linux GOARCH=amd64 CPU=4 GO_TEST_FLAGS='-p=2' make test-unit
               ;;
             linux-386-unit-1-cpu)
               GOOS=linux GOARCH=386 CPU=1 GO_TEST_FLAGS='-p=4' make test-unit

@@ -18,15 +18,20 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/coreos/go-semver/semver"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
 	"go.etcd.io/etcd/client/pkg/v3/fileutil"
+	"go.etcd.io/etcd/pkg/v3/expect"
 	"go.etcd.io/etcd/server/v3/etcdserver"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v2store"
 	"go.etcd.io/etcd/tests/v3/framework/config"
@@ -54,7 +59,7 @@ func createV2store(t testing.TB, dataDirPath string) string {
 	for i := 0; i < 10; i++ {
 		if err := e2e.CURLPut(epc, e2e.CURLReq{
 			Endpoint: "/v2/keys/foo", Value: "bar" + fmt.Sprint(i),
-			Expected: `{"action":"set","node":{"key":"/foo","value":"bar` + fmt.Sprint(i)}); err != nil {
+			Expected: expect.ExpectedResponse{Value: `{"action":"set","node":{"key":"/foo","value":"bar` + fmt.Sprint(i)}}); err != nil {
 			t.Fatalf("failed put with curl (%v)", err)
 		}
 	}
@@ -115,27 +120,22 @@ func TestV2DeprecationSnapshotMatches(t *testing.T) {
 	var snapshotCount uint64 = 10
 	epc := runEtcdAndCreateSnapshot(t, e2e.LastVersion, lastReleaseData, snapshotCount)
 	oldMemberDataDir := epc.Procs[0].Config().DataDirPath
-	cc1, err := e2e.NewEtcdctl(epc.Cfg.Client, epc.EndpointsGRPC())
-	assert.NoError(t, err)
+	cc1 := epc.Etcdctl()
 	members1 := addAndRemoveKeysAndMembers(ctx, t, cc1, snapshotCount)
 	assert.NoError(t, epc.Close())
 	epc = runEtcdAndCreateSnapshot(t, e2e.CurrentVersion, currentReleaseData, snapshotCount)
 	newMemberDataDir := epc.Procs[0].Config().DataDirPath
-	cc2, err := e2e.NewEtcdctl(epc.Cfg.Client, epc.EndpointsGRPC())
-	assert.NoError(t, err)
+	cc2 := epc.Etcdctl()
 	members2 := addAndRemoveKeysAndMembers(ctx, t, cc2, snapshotCount)
 	assert.NoError(t, epc.Close())
 
 	assertSnapshotsMatch(t, oldMemberDataDir, newMemberDataDir, func(data []byte) []byte {
-		// Patch cluster version
-		data = bytes.Replace(data, []byte("3.5.0"), []byte("X.X.X"), -1)
-		data = bytes.Replace(data, []byte("3.6.0"), []byte("X.X.X"), -1)
 		// Patch members ids
 		for i, mid := range members1 {
-			data = bytes.Replace(data, []byte(fmt.Sprintf("%x", mid)), []byte(fmt.Sprintf("member%d", i+1)), -1)
+			data = bytes.Replace(data, []byte(fmt.Sprintf("%x", mid)), []byte(fmt.Sprintf("%d", i+1)), -1)
 		}
 		for i, mid := range members2 {
-			data = bytes.Replace(data, []byte(fmt.Sprintf("%x", mid)), []byte(fmt.Sprintf("member%d", i+1)), -1)
+			data = bytes.Replace(data, []byte(fmt.Sprintf("%x", mid)), []byte(fmt.Sprintf("%d", i+1)), -1)
 		}
 		return data
 	})
@@ -152,9 +152,7 @@ func TestV2DeprecationSnapshotRecover(t *testing.T) {
 	}
 	epc := runEtcdAndCreateSnapshot(t, e2e.LastVersion, dataDir, 10)
 
-	cc, err := e2e.NewEtcdctl(epc.Cfg.Client, epc.EndpointsGRPC())
-	assert.NoError(t, err)
-
+	cc := epc.Etcdctl()
 	lastReleaseGetResponse, err := cc.Get(ctx, "", config.GetOptions{Prefix: true})
 	assert.NoError(t, err)
 
@@ -169,8 +167,7 @@ func TestV2DeprecationSnapshotRecover(t *testing.T) {
 	epc, err = e2e.NewEtcdProcessCluster(context.TODO(), t, e2e.WithConfig(cfg))
 	assert.NoError(t, err)
 
-	cc, err = e2e.NewEtcdctl(epc.Cfg.Client, epc.EndpointsGRPC())
-	assert.NoError(t, err)
+	cc = epc.Etcdctl()
 	currentReleaseGetResponse, err := cc.Get(ctx, "", config.GetOptions{Prefix: true})
 	assert.NoError(t, err)
 
@@ -255,7 +252,23 @@ func assertSnapshotsMatch(t testing.TB, firstDataDir, secondDataDir string, patc
 		if err != nil {
 			t.Fatal(err)
 		}
-		assert.Equal(t, openSnap(patch(firstSnapshot.Data)), openSnap(patch(secondSnapshot.Data)))
+		assertMembershipEqual(t, openSnap(patch(firstSnapshot.Data)), openSnap(patch(secondSnapshot.Data)))
+	}
+}
+
+func assertMembershipEqual(t testing.TB, firstStore v2store.Store, secondStore v2store.Store) {
+	rc1 := membership.NewCluster(zaptest.NewLogger(t))
+	rc1.SetStore(firstStore)
+	rc1.Recover(func(lg *zap.Logger, v *semver.Version) { return })
+
+	rc2 := membership.NewCluster(zaptest.NewLogger(t))
+	rc2.SetStore(secondStore)
+	rc2.Recover(func(lg *zap.Logger, v *semver.Version) { return })
+
+	//membership should match
+	if !reflect.DeepEqual(rc1.Members(), rc2.Members()) {
+		t.Logf("memberids_from_last_version = %+v, member_ids_from_current_version = %+v", rc1.MemberIDs(), rc2.MemberIDs())
+		t.Errorf("members_from_last_version_snapshot = %+v, members_from_current_version_snapshot %+v", rc1.Members(), rc2.Members())
 	}
 }
 

@@ -44,18 +44,28 @@ type Bucket interface {
 }
 
 type BatchTx interface {
-	ReadTx
-	UnsafeCreateBucket(bucket Bucket)
-	UnsafeDeleteBucket(bucket Bucket)
-	UnsafePut(bucket Bucket, key []byte, value []byte)
-	UnsafeSeqPut(bucket Bucket, key []byte, value []byte)
-	UnsafeDelete(bucket Bucket, key []byte)
+	Lock()
+	Unlock()
 	// Commit commits a previous tx and begins a new writable one.
 	Commit()
 	// CommitAndStop commits the previous tx and does not create a new one.
 	CommitAndStop()
 	LockInsideApply()
 	LockOutsideApply()
+	UnsafeReadWriter
+}
+
+type UnsafeReadWriter interface {
+	UnsafeReader
+	UnsafeWriter
+}
+
+type UnsafeWriter interface {
+	UnsafeCreateBucket(bucket Bucket)
+	UnsafeDeleteBucket(bucket Bucket)
+	UnsafePut(bucket Bucket, key []byte, value []byte)
+	UnsafeSeqPut(bucket Bucket, key []byte, value []byte)
+	UnsafeDelete(bucket Bucket, key []byte)
 }
 
 type batchTx struct {
@@ -99,18 +109,6 @@ func (t *batchTx) Unlock() {
 		t.commit(false)
 	}
 	t.Mutex.Unlock()
-}
-
-// BatchTx interface embeds ReadTx interface. But RLock() and RUnlock() do not
-// have appropriate semantics in BatchTx interface. Therefore should not be called.
-// TODO: might want to decouple ReadTx and BatchTx
-
-func (t *batchTx) RLock() {
-	panic("unexpected RLock")
-}
-
-func (t *batchTx) RUnlock() {
-	panic("unexpected RUnlock")
 }
 
 func (t *batchTx) UnsafeCreateBucket(bucket Bucket) {

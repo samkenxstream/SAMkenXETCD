@@ -65,7 +65,7 @@ fuzz:
 verify: verify-gofmt verify-bom verify-lint verify-dep verify-shellcheck verify-goword \
 	verify-govet verify-license-header verify-receiver-name verify-mod-tidy verify-shellcheck \
 	verify-shellws verify-proto-annotations verify-genproto verify-goimport verify-yamllint
-fix: fix-bom fix-lint fix-yamllint
+fix: fix-goimports fix-bom fix-lint fix-yamllint
 	./scripts/fix.sh
 
 .PHONY: verify-gofmt
@@ -76,7 +76,7 @@ verify-gofmt:
 verify-bom:
 	PASSES="bom" ./scripts/test.sh
 
-.PHONY: update-bom
+.PHONY: fix-bom
 fix-bom:
 	./scripts/updatebom.sh
 
@@ -88,7 +88,7 @@ verify-dep:
 verify-lint:
 	golangci-lint run --config tools/.golangci.yaml
 
-.PHONY: update-lint
+.PHONY: fix-lint
 fix-lint:
 	golangci-lint run --config tools/.golangci.yaml --fix
 
@@ -132,6 +132,10 @@ verify-genproto:
 verify-goimport:
 	PASSES="goimport" ./scripts/test.sh
 
+.PHONY: fix-goimports
+fix-goimports:
+	./scripts/fix-goimports.sh
+
 .PHONY: verify-yamllint
 verify-yamllint:
 	yamllint --config-file tools/.yamllint .
@@ -145,6 +149,19 @@ ifeq (, $(shell which yamlfmt))
 endif
 	yamlfmt -conf tools/.yamlfmt .
 
+# Tools
+
+.PHONY: install-lazyfs
+install-lazyfs: bin/lazyfs
+
+bin/lazyfs:
+	rm /tmp/lazyfs -rf
+	git clone --depth 1 --branch 0.2.0 https://github.com/dsrhaslab/lazyfs /tmp/lazyfs
+	cd /tmp/lazyfs/libs/libpcache; ./build.sh
+	cd /tmp/lazyfs/lazyfs; ./build.sh
+	mkdir -p ./bin
+	cp /tmp/lazyfs/lazyfs/build/lazyfs ./bin/lazyfs
+
 # Cleanup
 
 clean:
@@ -152,6 +169,7 @@ clean:
 	rm -rf ./covdir
 	rm -f ./bin/Dockerfile-release
 	rm -rf ./bin/etcd*
+	rm -rf ./bin/lazyfs
 	rm -rf ./default.etcd
 	rm -rf ./tests/e2e/default.etcd
 	rm -rf ./release

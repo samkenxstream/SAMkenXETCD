@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,12 +38,19 @@ var (
 	ErrProcessRunning = fmt.Errorf("process is still running")
 )
 
+type ExpectedResponse struct {
+	Value         string
+	IsRegularExpr bool
+}
+
 type ExpectProcess struct {
 	cfg expectConfig
 
 	cmd  *exec.Cmd
 	fpty *os.File
 	wg   sync.WaitGroup
+
+	readCloseCh chan struct{} // close it if async read goroutine exits
 
 	mu       sync.Mutex // protects lines, count, cur, exitErr and exitCode
 	lines    []string
@@ -67,6 +75,7 @@ func NewExpectWithEnv(name string, args []string, env []string, serverProcessCon
 			args: args,
 			env:  env,
 		},
+		readCloseCh: make(chan struct{}),
 	}
 	ep.cmd = commandFromConfig(ep.cfg)
 
@@ -100,7 +109,10 @@ func (ep *ExpectProcess) Pid() int {
 }
 
 func (ep *ExpectProcess) read() {
-	defer ep.wg.Done()
+	defer func() {
+		ep.wg.Done()
+		close(ep.readCloseCh)
+	}()
 	defer func(fpty *os.File) {
 		err := fpty.Close()
 		if err != nil {
@@ -187,8 +199,24 @@ func (ep *ExpectProcess) ExpectFunc(ctx context.Context, f func(string) bool) (s
 		}
 	}
 
+	select {
+	// NOTE: we wait readCloseCh for ep.read() to complete draining the log before acquring the lock.
+	case <-ep.readCloseCh:
+	case <-ctx.Done():
+		return "", fmt.Errorf("failed to find match string: %w", ctx.Err())
+	}
+
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
+
+	// retry it since we get all the log data
+	for i < len(ep.lines) {
+		line := ep.lines[i]
+		i++
+		if f(line) {
+			return line, nil
+		}
+	}
 
 	lastLinesIndex := len(ep.lines) - DEBUG_LINES_TAIL
 	if lastLinesIndex < 0 {
@@ -201,14 +229,29 @@ func (ep *ExpectProcess) ExpectFunc(ctx context.Context, f func(string) bool) (s
 }
 
 // ExpectWithContext returns the first line containing the given string.
-func (ep *ExpectProcess) ExpectWithContext(ctx context.Context, s string) (string, error) {
-	return ep.ExpectFunc(ctx, func(txt string) bool { return strings.Contains(txt, s) })
+func (ep *ExpectProcess) ExpectWithContext(ctx context.Context, s ExpectedResponse) (string, error) {
+	var (
+		expr *regexp.Regexp
+		err  error
+	)
+	if s.IsRegularExpr {
+		expr, err = regexp.Compile(s.Value)
+		if err != nil {
+			return "", err
+		}
+	}
+	return ep.ExpectFunc(ctx, func(txt string) bool {
+		if expr != nil {
+			return expr.MatchString(txt)
+		}
+		return strings.Contains(txt, s.Value)
+	})
 }
 
 // Expect returns the first line containing the given string.
 // Deprecated: please use ExpectWithContext instead.
 func (ep *ExpectProcess) Expect(s string) (string, error) {
-	return ep.ExpectWithContext(context.Background(), s)
+	return ep.ExpectWithContext(context.Background(), ExpectedResponse{Value: s})
 }
 
 // LineCount returns the number of recorded lines since
@@ -227,6 +270,22 @@ func (ep *ExpectProcess) ExitCode() (int, error) {
 
 	if ep.cmd == nil {
 		return ep.exitCode, nil
+	}
+
+	if ep.exitErr != nil {
+		// If the child process panics or is killed, for instance, the
+		// goFailpoint triggers the exit event, the ep.cmd isn't nil and
+		// the exitCode will describe the case.
+		if ep.exitCode != 0 {
+			return ep.exitCode, nil
+		}
+
+		// If the wait4(2) in waitProcess returns error, the child
+		// process might be reaped if the process handles the SIGCHILD
+		// in other goroutine. It's unlikely in this repo. But we
+		// should return the error for log even if the child process
+		// is still running.
+		return 0, ep.exitErr
 	}
 
 	return 0, ErrProcessRunning
@@ -248,7 +307,7 @@ func (ep *ExpectProcess) ExitError() error {
 // Stop signals the process to terminate via SIGTERM
 func (ep *ExpectProcess) Stop() error {
 	err := ep.Signal(syscall.SIGTERM)
-	if err != nil && strings.Contains(err.Error(), "os: process already finished") {
+	if err != nil && errors.Is(err, os.ErrProcessDone) {
 		return nil
 	}
 	return err
@@ -274,13 +333,23 @@ func (ep *ExpectProcess) waitProcess() error {
 
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
-	ep.exitCode = state.ExitCode()
+	ep.exitCode = exitCode(state)
 
 	if !state.Success() {
 		return fmt.Errorf("unexpected exit code [%d] after running [%s]", ep.exitCode, ep.cmd.String())
 	}
 
 	return nil
+}
+
+// exitCode returns correct exit code for a process based on signaled or exited.
+func exitCode(state *os.ProcessState) int {
+	status := state.Sys().(syscall.WaitStatus)
+
+	if status.Signaled() {
+		return 128 + int(status.Signal())
+	}
+	return status.ExitStatus()
 }
 
 // Wait waits for the process to finish.

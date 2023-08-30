@@ -56,12 +56,13 @@ type EtcdProcess interface {
 	Config() *EtcdServerProcessConfig
 	PeerProxy() proxy.Server
 	Failpoints() *BinaryFailpoints
+	LazyFS() *LazyFS
 	Logs() LogsExpect
 	Kill() error
 }
 
 type LogsExpect interface {
-	ExpectWithContext(context.Context, string) (string, error)
+	ExpectWithContext(context.Context, expect.ExpectedResponse) (string, error)
 	Lines() []string
 	LineCount() int
 }
@@ -70,6 +71,7 @@ type EtcdServerProcess struct {
 	cfg        *EtcdServerProcessConfig
 	proc       *expect.ExpectProcess
 	proxy      proxy.Server
+	lazyfs     *LazyFS
 	failpoints *BinaryFailpoints
 	donec      chan struct{} // closed when Interact() terminates
 }
@@ -96,10 +98,11 @@ type EtcdServerProcessConfig struct {
 	InitialCluster string
 	GoFailPort     int
 
-	Proxy *proxy.ServerConfig
+	LazyFSEnabled bool
+	Proxy         *proxy.ServerConfig
 }
 
-func NewEtcdServerProcess(cfg *EtcdServerProcessConfig) (*EtcdServerProcess, error) {
+func NewEtcdServerProcess(t testing.TB, cfg *EtcdServerProcessConfig) (*EtcdServerProcess, error) {
 	if !fileutil.Exist(cfg.ExecPath) {
 		return nil, fmt.Errorf("could not find etcd binary: %s", cfg.ExecPath)
 	}
@@ -107,10 +110,16 @@ func NewEtcdServerProcess(cfg *EtcdServerProcessConfig) (*EtcdServerProcess, err
 		if err := os.RemoveAll(cfg.DataDirPath); err != nil {
 			return nil, err
 		}
+		if err := os.Mkdir(cfg.DataDirPath, 0700); err != nil {
+			return nil, err
+		}
 	}
 	ep := &EtcdServerProcess{cfg: cfg, donec: make(chan struct{})}
 	if cfg.GoFailPort != 0 {
 		ep.failpoints = &BinaryFailpoints{member: ep}
+	}
+	if cfg.LazyFSEnabled {
+		ep.lazyfs = newLazyFS(cfg.lg, cfg.DataDirPath, t)
 	}
 	return ep, nil
 }
@@ -146,6 +155,14 @@ func (ep *EtcdServerProcess) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	if ep.lazyfs != nil {
+		ep.cfg.lg.Info("starting lazyfs...", zap.String("name", ep.cfg.Name))
+		err := ep.lazyfs.Start(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
 	ep.cfg.lg.Info("starting server...", zap.String("name", ep.cfg.Name))
 	proc, err := SpawnCmdWithLogger(ep.cfg.lg, append([]string{ep.cfg.ExecPath}, ep.cfg.Args...), ep.cfg.EnvVars, ep.cfg.Name)
 	if err != nil {
@@ -205,6 +222,14 @@ func (ep *EtcdServerProcess) Stop() (err error) {
 			return err
 		}
 	}
+	if ep.lazyfs != nil {
+		ep.cfg.lg.Info("stopping lazyfs...", zap.String("name", ep.cfg.Name))
+		err = ep.lazyfs.Stop()
+		ep.lazyfs = nil
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -246,7 +271,14 @@ func (ep *EtcdServerProcess) Wait(ctx context.Context) error {
 		defer close(ch)
 		if ep.proc != nil {
 			ep.proc.Wait()
-			ep.cfg.lg.Info("server exited", zap.String("name", ep.cfg.Name))
+
+			exitCode, exitErr := ep.proc.ExitCode()
+
+			ep.cfg.lg.Info("server exited",
+				zap.String("name", ep.cfg.Name),
+				zap.Int("code", exitCode),
+				zap.Error(exitErr),
+			)
 		}
 	}()
 	select {
@@ -262,11 +294,16 @@ func (ep *EtcdServerProcess) IsRunning() bool {
 	if ep.proc == nil {
 		return false
 	}
-	_, err := ep.proc.ExitCode()
+
+	exitCode, err := ep.proc.ExitCode()
 	if err == expect.ErrProcessRunning {
 		return true
 	}
-	ep.cfg.lg.Info("server exited", zap.String("name", ep.cfg.Name))
+
+	ep.cfg.lg.Info("server exited",
+		zap.String("name", ep.cfg.Name),
+		zap.Int("code", exitCode),
+		zap.Error(err))
 	ep.proc = nil
 	return false
 }
@@ -276,7 +313,7 @@ func AssertProcessLogs(t *testing.T, ep EtcdProcess, expectLog string) {
 	var err error
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err = ep.Logs().ExpectWithContext(ctx, expectLog)
+	_, err = ep.Logs().ExpectWithContext(ctx, expect.ExpectedResponse{Value: expectLog})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,6 +321,10 @@ func AssertProcessLogs(t *testing.T, ep EtcdProcess, expectLog string) {
 
 func (ep *EtcdServerProcess) PeerProxy() proxy.Server {
 	return ep.proxy
+}
+
+func (ep *EtcdServerProcess) LazyFS() *LazyFS {
+	return ep.lazyfs
 }
 
 func (ep *EtcdServerProcess) Failpoints() *BinaryFailpoints {

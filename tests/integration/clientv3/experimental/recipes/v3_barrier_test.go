@@ -15,6 +15,7 @@
 package recipes_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -44,6 +45,11 @@ func testBarrier(t *testing.T, waiters int, chooseClient func() *clientv3.Client
 	}
 	if err := b.Hold(); err == nil {
 		t.Fatalf("able to double-hold barrier")
+	}
+
+	// put a random key to move the revision forward
+	if _, err := chooseClient().Put(context.Background(), "x", ""); err != nil {
+		t.Errorf("could not put x (%v)", err)
 	}
 
 	donec := make(chan struct{})
@@ -79,6 +85,45 @@ func testBarrier(t *testing.T, waiters int, chooseClient func() *clientv3.Client
 		select {
 		case <-timerC:
 			t.Fatalf("barrier timed out")
+		case <-donec:
+		}
+	}
+}
+
+func TestBarrierWaitNonexistentKey(t *testing.T) {
+	integration2.BeforeTest(t)
+	clus := integration2.NewCluster(t, &integration2.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+	cli := clus.Client(0)
+
+	if _, err := cli.Put(cli.Ctx(), "test-barrier-0", ""); err != nil {
+		t.Errorf("could not put test-barrier0, err:%v", err)
+	}
+
+	donec := make(chan struct{})
+	stopc := make(chan struct{})
+	defer close(stopc)
+
+	waiters := 5
+	for i := 0; i < waiters; i++ {
+		go func() {
+			br := recipe.NewBarrier(cli, "test-barrier")
+			if err := br.Wait(); err != nil {
+				t.Errorf("could not wait on barrier (%v)", err)
+			}
+			select {
+			case donec <- struct{}{}:
+			case <-stopc:
+			}
+		}()
+	}
+
+	// all waiters should return immediately if waiting on a nonexistent key "test-barrier" even if key "test-barrier-0" exists
+	timerC := time.After(time.Duration(waiters*100) * time.Millisecond)
+	for i := 0; i < waiters; i++ {
+		select {
+		case <-timerC:
+			t.Fatal("barrier timed out")
 		case <-donec:
 		}
 	}

@@ -1,18 +1,18 @@
 ---
-name: E2E-arm64
+name: Reusable Arm64 E2E Workflow
 on:
-  schedule:
-    - cron: '0 1 * * *' # runs daily at 1am.
+  workflow_call:
+    inputs:
+      etcdBranch:
+        required: true
+        type: string
 permissions: read-all
 jobs:
-  goversion:
-    uses: ./.github/workflows/go-version.yaml
   test:
     # this is to prevent the job to run at forked projects
     if: github.repository == 'etcd-io/etcd'
     runs-on: [self-hosted, Linux, ARM64]
-    needs: goversion
-    container: golang:1.19-bullseye
+    container: golang:1.20-bullseye
     defaults:
       run:
         shell: bash
@@ -22,13 +22,16 @@ jobs:
         target:
           - linux-arm64-e2e
     steps:
-      - uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab # v3.5.2
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+        with:
+          ref: "${{ inputs.etcdBranch }}"
       # https://github.com/actions/checkout/issues/1169
       - run: git config --system --add safe.directory '*'
-      - uses: actions/setup-go@fac708d6674e30b6ba41289acaab6d4b75aa0753 # v4.0.1
+      - id: goversion
+        run: echo "goversion=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@93397bea11091df50f3d7e59dc26a7711a8bcfbe # v4.1.0
         with:
-          go-version: ${{ needs.goversion.outputs.goversion }}
-      - run: date
+          go-version: ${{ steps.goversion.outputs.goversion }}
       - env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -38,7 +41,7 @@ jobs:
           echo "${TARGET}"
           case "${TARGET}" in
             linux-arm64-e2e)
-              GOOS=linux GOARCH=arm64 CPU=4 EXPECT_DEBUG=true RACE=true make test-e2e-release
+              GOOS=linux GOARCH=arm64 CPU=4 EXPECT_DEBUG=true make test-e2e-release
               ;;
             *)
               echo "Failed to find target"

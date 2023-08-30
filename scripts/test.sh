@@ -68,7 +68,7 @@ fi
 
 # determine whether target supports race detection
 if [ -z "${RACE:-}" ] ; then
-  if [ "$GOARCH" == "amd64" ]; then
+  if [ "$GOARCH" == "amd64" ] || [ "$GOARCH" == "arm64" ]; then
     RACE="--race"
   else
     RACE="--race=false"
@@ -103,8 +103,8 @@ function build_pass {
 function run_unit_tests {
   local pkgs="${1:-./...}"
   shift 1
-  # shellcheck disable=SC2086
-  GOLANG_TEST_SHORT=true go_test "${pkgs}" "parallel" : -short -timeout="${TIMEOUT:-3m}" "${COMMON_TEST_FLAGS[@]}" "${RUN_ARG[@]}" "$@"
+  # shellcheck disable=SC2068 #For context see - https://github.com/etcd-io/etcd/pull/16433#issuecomment-1684312755
+  GOLANG_TEST_SHORT=true go_test "${pkgs}" "parallel" : -short -timeout="${TIMEOUT:-3m}" ${COMMON_TEST_FLAGS[@]:-} ${RUN_ARG[@]:-} "$@"
 }
 
 function unit_pass {
@@ -113,27 +113,33 @@ function unit_pass {
 
 function integration_extra {
   if [ -z "${PKG}" ] ; then
-    run_for_module "tests"  go_test "./integration/v2store/..." "keep_going" : -timeout="${TIMEOUT:-5m}" "${RUN_ARG[@]}" "${COMMON_TEST_FLAGS[@]}" "$@" || return $?
+    # shellcheck disable=SC2068
+    run_for_module "tests"  go_test "./integration/v2store/..." "keep_going" : -timeout="${TIMEOUT:-5m}" ${COMMON_TEST_FLAGS[@]:-} ${RUN_ARG[@]:-} "$@" || return $?
   else
     log_warning "integration_extra ignored when PKG is specified"
   fi
 }
 
 function integration_pass {
-  run_for_module "tests" go_test "./integration/..." "parallel" : -timeout="${TIMEOUT:-15m}" "${COMMON_TEST_FLAGS[@]}" "${RUN_ARG[@]}" -p=2 "$@" || return $?
-  run_for_module "tests" go_test "./common/..." "parallel" : --tags=integration -timeout="${TIMEOUT:-15m}" "${COMMON_TEST_FLAGS[@]}" -p=2 "${RUN_ARG[@]}" "$@" || return $?
+  # shellcheck disable=SC2068
+  run_for_module "tests" go_test "./integration/..." "parallel" : -timeout="${TIMEOUT:-15m}" ${COMMON_TEST_FLAGS[@]:-} ${RUN_ARG[@]:-} -p=2 "$@" || return $?
+  # shellcheck disable=SC2068
+  run_for_module "tests" go_test "./common/..." "parallel" : --tags=integration -timeout="${TIMEOUT:-15m}" ${COMMON_TEST_FLAGS[@]:-} ${RUN_ARG[@]:-} -p=2 "$@" || return $?
   integration_extra "$@"
 }
 
 function e2e_pass {
   # e2e tests are running pre-build binary. Settings like --race,-cover,-cpu does not have any impact.
-  run_for_module "tests" go_test "./e2e/..." "keep_going" : -timeout="${TIMEOUT:-30m}" "${RUN_ARG[@]}" "$@" || return $?
-  run_for_module "tests" go_test "./common/..." "keep_going" : --tags=e2e -timeout="${TIMEOUT:-30m}" "${RUN_ARG[@]}" "$@"
+  # shellcheck disable=SC2068
+  run_for_module "tests" go_test "./e2e/..." "keep_going" : -timeout="${TIMEOUT:-30m}" ${RUN_ARG[@]:-} "$@" || return $?
+  # shellcheck disable=SC2068
+  run_for_module "tests" go_test "./common/..." "keep_going" : --tags=e2e -timeout="${TIMEOUT:-30m}" ${RUN_ARG[@]:-} "$@"
 }
 
 function robustness_pass {
   # e2e tests are running pre-build binary. Settings like --race,-cover,-cpu does not have any impact.
-  run_for_module "tests" go_test "./robustness" "keep_going" : -timeout="${TIMEOUT:-30m}" "${RUN_ARG[@]}" "$@"
+  # shellcheck disable=SC2068
+  run_for_module "tests" go_test "./robustness" "keep_going" : -timeout="${TIMEOUT:-30m}" ${RUN_ARG[@]:-} "$@"
 }
 
 function integration_e2e_pass {
@@ -164,13 +170,13 @@ function grpcproxy_pass {
 }
 
 function grpcproxy_integration_pass {
-  run_for_module "tests" go_test "./integration/..." "fail_fast" : \
-      -timeout=30m -tags cluster_proxy "${COMMON_TEST_FLAGS[@]}" "$@"
+  # shellcheck disable=SC2068
+  run_for_module "tests" go_test "./integration/..." "fail_fast" : -timeout=30m -tags cluster_proxy ${COMMON_TEST_FLAGS[@]:-} "$@"
 }
 
 function grpcproxy_e2e_pass {
-  run_for_module "tests" go_test "./e2e" "fail_fast" : \
-      -timeout=30m -tags cluster_proxy "${COMMON_TEST_FLAGS[@]}" "$@"
+  # shellcheck disable=SC2068
+  run_for_module "tests" go_test "./e2e" "fail_fast" : -timeout=30m -tags cluster_proxy ${COMMON_TEST_FLAGS[@]:-} "$@"
 }
 
 ################# COVERAGE #####################################################
@@ -234,7 +240,7 @@ function merge_cov_files {
     if ! (( "${i}" % 20 )); then
       log_callout "${i} of ${count}: Merging file: ${f}"
     fi
-    run_go_tool "github.com/gyuho/gocovmerge" "${f}" "${cover_out_file}"  > "${coverdir}/cover.tmp" 2>/dev/null
+    run_go_tool "github.com/alexfalkowski/gocovmerge" "${f}" "${cover_out_file}"  > "${coverdir}/cover.tmp" 2>/dev/null
     if [ -s "${coverdir}"/cover.tmp ]; then
       mv "${coverdir}/cover.tmp" "${cover_out_file}"
     fi
@@ -559,8 +565,30 @@ function dep_pass {
 
 function release_pass {
   rm -f ./bin/etcd-last-release
-  # to grab latest patch release; bump this up for every minor release
-  UPGRADE_VER=$(git tag -l --sort=-version:refname "v3.5.*" | head -1 | cut -d- -f1)
+
+  # Work out the previous release based on the version reported by etcd binary
+  binary_version=$(./bin/etcd --version | grep --only-matching --perl-regexp '(?<=etcd Version: )\d+\.\d+')
+  binary_major=$(echo "${binary_version}" | cut -d '.' -f 1)
+  binary_minor=$(echo "${binary_version}" | cut -d '.' -f 2)
+  previous_minor=$((binary_minor - 1))
+
+  # Handle the edge case where we go to a new major version
+  # When this happens we obtain latest minor release of previous major
+  if [ "${binary_minor}" -eq 0 ]; then
+    binary_major=$((binary_major - 1))
+    previous_minor=$(git ls-remote --tags https://github.com/etcd-io/etcd.git \
+    | grep --only-matching --perl-regexp "(?<=v)${binary_major}.\d.[\d]+?(?=[\^])" \
+    | sort --numeric-sort --key 1.3 | tail -1 | cut -d '.' -f 2)
+  fi
+  
+  # This gets a list of all remote tags for the release branch in regex
+  # Sort key is used to sort numerically by patch version
+  # Latest version is then stored for use below
+  UPGRADE_VER=$(git ls-remote --tags https://github.com/etcd-io/etcd.git \
+    | grep --only-matching --perl-regexp "(?<=v)${binary_major}.${previous_minor}.[\d]+?(?=[\^])" \
+    | sort --numeric-sort --key 1.5 | tail -1 | sed 's/^/v/')
+  log_callout "Found latest release: ${UPGRADE_VER}."
+
   if [ -n "${MANUAL_VER:-}" ]; then
     # in case, we need to test against different version
     UPGRADE_VER=$MANUAL_VER

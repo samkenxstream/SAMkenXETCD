@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/pkg/v3/proxy"
 	"go.etcd.io/etcd/server/v3/etcdserver"
 	"go.etcd.io/etcd/tests/v3/framework/config"
@@ -143,8 +144,11 @@ type EtcdProcessClusterConfig struct {
 
 	ClusterSize int
 
-	BaseScheme string
-	BasePort   int
+	// BasePeerScheme specifies scheme of --listen-peer-urls and --initial-advertise-peer-urls
+	BasePeerScheme string
+	BasePort       int
+	// BaseClientScheme specifies scheme of --listen-client-urls, --listen-client-http-urls and --initial-advertise-client-urls
+	BaseClientScheme string
 
 	MetricsURLScheme string
 
@@ -181,6 +185,7 @@ type EtcdProcessClusterConfig struct {
 	CompactHashCheckEnabled bool
 	CompactHashCheckTime    time.Duration
 	GoFailEnabled           bool
+	LazyFSEnabled           bool
 	CompactionBatchLimit    int
 	CompactionSleepInterval time.Duration
 
@@ -240,12 +245,16 @@ func WithClusterSize(size int) EPClusterOption {
 	return func(c *EtcdProcessClusterConfig) { c.ClusterSize = size }
 }
 
-func WithBaseScheme(scheme string) EPClusterOption {
-	return func(c *EtcdProcessClusterConfig) { c.BaseScheme = scheme }
+func WithBasePeerScheme(scheme string) EPClusterOption {
+	return func(c *EtcdProcessClusterConfig) { c.BasePeerScheme = scheme }
 }
 
 func WithBasePort(port int) EPClusterOption {
 	return func(c *EtcdProcessClusterConfig) { c.BasePort = port }
+}
+
+func WithBaseClientScheme(scheme string) EPClusterOption {
+	return func(c *EtcdProcessClusterConfig) { c.BaseClientScheme = scheme }
 }
 
 func WithClientConnType(clientConnType ClientConnType) EPClusterOption {
@@ -316,6 +325,14 @@ func WithCorruptCheckTime(time time.Duration) EPClusterOption {
 	return func(c *EtcdProcessClusterConfig) { c.CorruptCheckTime = time }
 }
 
+func WithInitialClusterToken(token string) EPClusterOption {
+	return func(c *EtcdProcessClusterConfig) { c.InitialToken = token }
+}
+
+func WithInitialCorruptCheck(enabled bool) EPClusterOption {
+	return func(c *EtcdProcessClusterConfig) { c.InitialCorruptCheck = enabled }
+}
+
 func WithCompactHashCheckEnabled(enabled bool) EPClusterOption {
 	return func(c *EtcdProcessClusterConfig) { c.CompactHashCheckEnabled = enabled }
 }
@@ -326,6 +343,10 @@ func WithCompactHashCheckTime(time time.Duration) EPClusterOption {
 
 func WithGoFailEnabled(enabled bool) EPClusterOption {
 	return func(c *EtcdProcessClusterConfig) { c.GoFailEnabled = enabled }
+}
+
+func WithLazyFSEnabled(enabled bool) EPClusterOption {
+	return func(c *EtcdProcessClusterConfig) { c.LazyFSEnabled = enabled }
 }
 
 func WithWarningUnaryRequestDuration(time time.Duration) EPClusterOption {
@@ -391,7 +412,7 @@ func InitEtcdProcessCluster(t testing.TB, cfg *EtcdProcessClusterConfig) (*EtcdP
 
 	// launch etcd processes
 	for i := range etcdCfgs {
-		proc, err := NewEtcdProcess(etcdCfgs[i])
+		proc, err := NewEtcdProcess(t, etcdCfgs[i])
 		if err != nil {
 			epc.Close()
 			return nil, fmt.Errorf("cannot configure: %v", err)
@@ -418,21 +439,11 @@ func StartEtcdProcessCluster(ctx context.Context, epc *EtcdProcessCluster, cfg *
 }
 
 func (cfg *EtcdProcessClusterConfig) ClientScheme() string {
-	if cfg.Client.ConnectionType == ClientTLS {
-		return "https"
-	}
-	return "http"
+	return setupScheme(cfg.BaseClientScheme, cfg.Client.ConnectionType == ClientTLS)
 }
 
 func (cfg *EtcdProcessClusterConfig) PeerScheme() string {
-	peerScheme := cfg.BaseScheme
-	if peerScheme == "" {
-		peerScheme = "http"
-	}
-	if cfg.IsPeerTLS {
-		peerScheme += "s"
-	}
-	return peerScheme
+	return setupScheme(cfg.BasePeerScheme, cfg.IsPeerTLS)
 }
 
 func (cfg *EtcdProcessClusterConfig) EtcdAllServerProcessConfigs(tb testing.TB) []*EtcdServerProcessConfig {
@@ -475,10 +486,10 @@ func (cfg *EtcdProcessClusterConfig) EtcdServerProcessConfig(tb testing.TB, i in
 	clientHttpPort := port + 4
 
 	if cfg.Client.ConnectionType == ClientTLSAndNonTLS {
-		curl = clientURL(clientPort, ClientNonTLS)
-		curls = []string{curl, clientURL(clientPort, ClientTLS)}
+		curl = clientURL(cfg.ClientScheme(), clientPort, ClientNonTLS)
+		curls = []string{curl, clientURL(cfg.ClientScheme(), clientPort, ClientTLS)}
 	} else {
-		curl = clientURL(clientPort, cfg.Client.ConnectionType)
+		curl = clientURL(cfg.ClientScheme(), clientPort, cfg.Client.ConnectionType)
 		curls = []string{curl}
 	}
 
@@ -523,7 +534,7 @@ func (cfg *EtcdProcessClusterConfig) EtcdServerProcessConfig(tb testing.TB, i in
 	}
 	var clientHttpUrl string
 	if cfg.ClientHttpSeparate {
-		clientHttpUrl = clientURL(clientHttpPort, cfg.Client.ConnectionType)
+		clientHttpUrl = clientURL(cfg.ClientScheme(), clientHttpPort, cfg.Client.ConnectionType)
 		args = append(args, "--listen-client-http-urls", clientHttpUrl)
 	}
 
@@ -653,16 +664,17 @@ func (cfg *EtcdProcessClusterConfig) EtcdServerProcessConfig(tb testing.TB, i in
 		InitialToken:  cfg.InitialToken,
 		GoFailPort:    gofailPort,
 		Proxy:         proxyCfg,
+		LazyFSEnabled: cfg.LazyFSEnabled,
 	}
 }
 
-func clientURL(port int, connType ClientConnType) string {
+func clientURL(scheme string, port int, connType ClientConnType) string {
 	curlHost := fmt.Sprintf("localhost:%d", port)
 	switch connType {
 	case ClientNonTLS:
-		return (&url.URL{Scheme: "http", Host: curlHost}).String()
+		return (&url.URL{Scheme: scheme, Host: curlHost}).String()
 	case ClientTLS:
-		return (&url.URL{Scheme: "https", Host: curlHost}).String()
+		return (&url.URL{Scheme: ToTLS(scheme), Host: curlHost}).String()
 	default:
 		panic(fmt.Sprintf("Unsupported connection type %v", connType))
 	}
@@ -783,7 +795,10 @@ func (epc *EtcdProcessCluster) CloseProc(ctx context.Context, finder func(EtcdPr
 	return proc.Close()
 }
 
-func (epc *EtcdProcessCluster) StartNewProc(ctx context.Context, cfg *EtcdProcessClusterConfig, tb testing.TB, opts ...config.ClientOption) error {
+// StartNewProc grows cluster size by one with two phases
+// Phase 1 - Inform cluster of new configuration
+// Phase 2 - Start new member
+func (epc *EtcdProcessCluster) StartNewProc(ctx context.Context, cfg *EtcdProcessClusterConfig, tb testing.TB, addAsLearner bool, opts ...config.ClientOption) (memberID uint64, err error) {
 	var serverCfg *EtcdServerProcessConfig
 	if cfg != nil {
 		serverCfg = cfg.EtcdServerProcessConfig(tb, epc.nextSeq)
@@ -803,22 +818,29 @@ func (epc *EtcdProcessCluster) StartNewProc(ctx context.Context, cfg *EtcdProces
 	epc.Cfg.SetInitialOrDiscovery(serverCfg, initialCluster, "existing")
 
 	// First add new member to cluster
+	tb.Logf("add new member to cluster; member-name %s, member-peer-url %s", serverCfg.Name, serverCfg.PeerURL.String())
 	memberCtl := epc.Etcdctl(opts...)
-	_, err := memberCtl.MemberAdd(ctx, serverCfg.Name, []string{serverCfg.PeerURL.String()})
+	var resp *clientv3.MemberAddResponse
+	if addAsLearner {
+		resp, err = memberCtl.MemberAddAsLearner(ctx, serverCfg.Name, []string{serverCfg.PeerURL.String()})
+	} else {
+		resp, err = memberCtl.MemberAdd(ctx, serverCfg.Name, []string{serverCfg.PeerURL.String()})
+	}
 	if err != nil {
-		return fmt.Errorf("failed to add new member: %w", err)
+		return 0, fmt.Errorf("failed to add new member: %w", err)
 	}
 
 	// Then start process
-	proc, err := NewEtcdProcess(serverCfg)
+	tb.Log("start new member")
+	proc, err := NewEtcdProcess(tb, serverCfg)
 	if err != nil {
 		epc.Close()
-		return fmt.Errorf("cannot configure: %v", err)
+		return 0, fmt.Errorf("cannot configure: %v", err)
 	}
 
 	epc.Procs = append(epc.Procs, proc)
 
-	return proc.Start(ctx)
+	return resp.Member.ID, proc.Start(ctx)
 }
 
 // UpdateProcOptions updates the options for a specific process. If no opt is set, then the config is identical
@@ -839,7 +861,7 @@ func (epc *EtcdProcessCluster) UpdateProcOptions(i int, tb testing.TB, opts ...E
 	}
 	epc.Cfg.SetInitialOrDiscovery(serverCfg, initialCluster, "new")
 
-	proc, err := NewEtcdProcess(serverCfg)
+	proc, err := NewEtcdProcess(tb, serverCfg)
 	if err != nil {
 		return err
 	}

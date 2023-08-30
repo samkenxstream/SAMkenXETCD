@@ -22,12 +22,13 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
+
 	"go.etcd.io/etcd/client/v3/naming/endpoints"
 	"go.etcd.io/etcd/client/v3/naming/resolver"
 	"go.etcd.io/etcd/pkg/v3/grpc_testing"
 	integration2 "go.etcd.io/etcd/tests/v3/framework/integration"
-	"google.golang.org/grpc"
-	testpb "google.golang.org/grpc/test/grpc_testing"
 )
 
 func testEtcdGrpcResolver(t *testing.T, lbPolicy string) {
@@ -93,7 +94,7 @@ func testEtcdGrpcResolver(t *testing.T, lbPolicy string) {
 
 	// Send more requests
 	lastResponse := []byte{'1'}
-	totalRequests := 1000
+	totalRequests := 3500
 	for i := 1; i < totalRequests; i++ {
 		resp, err := c.UnaryCall(context.TODO(), &testpb.SimpleRequest{}, grpc.WaitForReady(true))
 		if err != nil {
@@ -111,7 +112,7 @@ func testEtcdGrpcResolver(t *testing.T, lbPolicy string) {
 	// If the load balancing policy is pick first then return payload should equal number of requests
 	t.Logf("Last response: %v", string(lastResponse))
 	if lbPolicy == "pick_first" {
-		if string(lastResponse) != "1000" {
+		if string(lastResponse) != "3500" {
 			t.Fatalf("unexpected total responses from foo: %s", string(lastResponse))
 		}
 	}

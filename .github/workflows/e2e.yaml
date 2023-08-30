@@ -3,11 +3,13 @@ name: E2E
 on: [push, pull_request]
 permissions: read-all
 jobs:
-  goversion:
-    uses: ./.github/workflows/go-version.yaml
   test:
     runs-on: ubuntu-latest
-    needs: goversion
+    container:
+      image: golang:1.20-bullseye
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: true
       matrix:
@@ -15,11 +17,14 @@ jobs:
           - linux-amd64-e2e
           - linux-386-e2e
     steps:
-      - uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab # v3.5.2
-      - uses: actions/setup-go@fac708d6674e30b6ba41289acaab6d4b75aa0753 # v4.0.1
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      # https://github.com/actions/checkout/issues/1169
+      - run: git config --system --add safe.directory '*'
+      - id: goversion
+        run: echo "goversion=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@93397bea11091df50f3d7e59dc26a7711a8bcfbe # v4.1.0
         with:
-          go-version: ${{ needs.goversion.outputs.goversion }}
-      - run: date
+          go-version: ${{ steps.goversion.outputs.goversion }}
       - env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -29,10 +34,10 @@ jobs:
           echo "${TARGET}"
           case "${TARGET}" in
             linux-amd64-e2e)
-              VERBOSE=1 GOOS=linux GOARCH=amd64 CPU=4 EXPECT_DEBUG=true RACE=true make test-e2e-release
+              VERBOSE=1 GOOS=linux GOARCH=amd64 CPU=4 EXPECT_DEBUG=true make test-e2e-release
               ;;
             linux-386-e2e)
-              VERBOSE=1 GOOS=linux GOARCH=386 CPU=4 EXPECT_DEBUG=true RACE=true make test-e2e
+              VERBOSE=1 GOOS=linux GOARCH=386 CPU=4 EXPECT_DEBUG=true make test-e2e
               ;;
             *)
               echo "Failed to find target"

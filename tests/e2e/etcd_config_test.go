@@ -296,7 +296,7 @@ func TestGrpcproxyAndCommonName(t *testing.T) {
 		"--cacert", e2e.CaPath,
 	}
 
-	err := e2e.SpawnWithExpect(argsWithNonEmptyCN, "cert has non empty Common Name")
+	err := e2e.SpawnWithExpect(argsWithNonEmptyCN, expect.ExpectedResponse{Value: "cert has non empty Common Name"})
 	require.ErrorContains(t, err, "cert has non empty Common Name")
 
 	p, err := e2e.SpawnCmd(argsWithEmptyCN, nil)
@@ -411,12 +411,9 @@ func TestEtcdHealthyWithTinySnapshotCatchupEntries(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		clientId := i
 		g.Go(func() error {
-			cc, err := e2e.NewEtcdctl(epc.Cfg.Client, epc.EndpointsGRPC())
-			if err != nil {
-				return err
-			}
+			cc := epc.Etcdctl()
 			for j := 0; j < 100; j++ {
-				if err = cc.Put(ctx, "foo", fmt.Sprintf("bar%d", clientId), config.PutOptions{}); err != nil {
+				if err := cc.Put(ctx, "foo", fmt.Sprintf("bar%d", clientId), config.PutOptions{}); err != nil {
 					return err
 				}
 			}

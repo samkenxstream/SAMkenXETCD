@@ -19,12 +19,14 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 
+	"go.etcd.io/etcd/pkg/v3/expect"
 	"go.etcd.io/etcd/tests/v3/framework/config"
 	"go.etcd.io/etcd/tests/v3/framework/e2e"
 	"go.etcd.io/etcd/tests/v3/framework/testutils"
@@ -33,11 +35,39 @@ import (
 func TestAuthority(t *testing.T) {
 	tcs := []struct {
 		name                   string
+		useUnix                bool
 		useTLS                 bool
 		useInsecureTLS         bool
 		clientURLPattern       string
 		expectAuthorityPattern string
 	}{
+		{
+			name:                   "unix:path",
+			useUnix:                true,
+			clientURLPattern:       "unix:localhost:${MEMBER_PORT}",
+			expectAuthorityPattern: "localhost:${MEMBER_PORT}",
+		},
+		{
+			name:                   "unix://absolute_path",
+			useUnix:                true,
+			clientURLPattern:       "unix://localhost:${MEMBER_PORT}",
+			expectAuthorityPattern: "localhost:${MEMBER_PORT}",
+		},
+		// "unixs" is not standard schema supported by etcd
+		{
+			name:                   "unixs:absolute_path",
+			useUnix:                true,
+			useTLS:                 true,
+			clientURLPattern:       "unixs:localhost:${MEMBER_PORT}",
+			expectAuthorityPattern: "localhost:${MEMBER_PORT}",
+		},
+		{
+			name:                   "unixs://absolute_path",
+			useUnix:                true,
+			useTLS:                 true,
+			clientURLPattern:       "unixs://localhost:${MEMBER_PORT}",
+			expectAuthorityPattern: "localhost:${MEMBER_PORT}",
+		},
 		{
 			name:                   "http://domain[:port]",
 			clientURLPattern:       "http://localhost:${MEMBER_PORT}",
@@ -90,26 +120,30 @@ func TestAuthority(t *testing.T) {
 				cfg.Client.AutoTLS = tc.useInsecureTLS
 				// Enable debug mode to get logs with http2 headers (including authority)
 				cfg.EnvVars = map[string]string{"GODEBUG": "http2debug=2"}
+				if tc.useUnix {
+					cfg.BaseClientScheme = "unix"
+				}
 
 				epc, err := e2e.NewEtcdProcessCluster(context.TODO(), t, e2e.WithConfig(cfg))
 				if err != nil {
 					t.Fatalf("could not start etcd process cluster (%v)", err)
 				}
 				defer epc.Close()
-				endpoints := templateEndpoints(t, tc.clientURLPattern, epc)
 
+				endpoints := templateEndpoints(t, tc.clientURLPattern, epc)
 				client, err := e2e.NewEtcdctl(cfg.Client, endpoints)
 				assert.NoError(t, err)
-				err = client.Put(ctx, "foo", "bar", config.PutOptions{})
-				if err != nil {
-					t.Fatal(err)
+				for i := 0; i < 100; i++ {
+					err = client.Put(ctx, "foo", "bar", config.PutOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
 				}
 
 				testutils.ExecuteWithTimeout(t, 5*time.Second, func() {
-					assertAuthority(t, strings.ReplaceAll(tc.expectAuthorityPattern, "${MEMBER_PORT}", "20000"), epc)
+					assertAuthority(t, tc.expectAuthorityPattern, epc)
 				})
 			})
-
 		}
 	}
 }
@@ -125,26 +159,18 @@ func templateEndpoints(t *testing.T, pattern string, clus *e2e.EtcdProcessCluste
 	return endpoints
 }
 
-func assertAuthority(t *testing.T, expectAurhority string, clus *e2e.EtcdProcessCluster) {
-	var logs []e2e.LogsExpect
-	for _, proc := range clus.Procs {
-		logs = append(logs, proc.Logs())
-	}
-	line := firstMatch(t, `http2: decoded hpack field header field ":authority"`, logs...)
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
-	expectLine := fmt.Sprintf(`http2: decoded hpack field header field ":authority" = %q`, expectAurhority)
-	assert.True(t, strings.HasSuffix(line, expectLine), fmt.Sprintf("Got %q expected suffix %q", line, expectLine))
-}
+func assertAuthority(t *testing.T, expectAuthorityPattern string, clus *e2e.EtcdProcessCluster) {
+	for i := range clus.Procs {
+		line, _ := clus.Procs[i].Logs().ExpectWithContext(context.TODO(), expect.ExpectedResponse{Value: `http2: decoded hpack field header field ":authority"`})
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
 
-func firstMatch(t *testing.T, expectLine string, logs ...e2e.LogsExpect) string {
-	t.Helper()
-	match := make(chan string, len(logs))
-	for i := range logs {
-		go func(l e2e.LogsExpect) {
-			line, _ := l.ExpectWithContext(context.TODO(), expectLine)
-			match <- line
-		}(logs[i])
+		u, err := url.Parse(clus.Procs[i].EndpointsGRPC()[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectAuthority := strings.ReplaceAll(expectAuthorityPattern, "${MEMBER_PORT}", u.Port())
+		expectLine := fmt.Sprintf(`http2: decoded hpack field header field ":authority" = %q`, expectAuthority)
+		assert.True(t, strings.HasSuffix(line, expectLine), fmt.Sprintf("Got %q expected suffix %q", line, expectLine))
 	}
-	return <-match
 }

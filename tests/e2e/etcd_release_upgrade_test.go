@@ -23,6 +23,7 @@ import (
 
 	"go.etcd.io/etcd/api/v3/version"
 	"go.etcd.io/etcd/client/pkg/v3/fileutil"
+	"go.etcd.io/etcd/pkg/v3/expect"
 	"go.etcd.io/etcd/tests/v3/framework/e2e"
 )
 
@@ -38,7 +39,7 @@ func TestReleaseUpgrade(t *testing.T) {
 	epc, err := e2e.NewEtcdProcessCluster(context.TODO(), t,
 		e2e.WithVersion(e2e.LastVersion),
 		e2e.WithSnapshotCount(3),
-		e2e.WithBaseScheme("unix"), // to avoid port conflict
+		e2e.WithBasePeerScheme("unix"), // to avoid port conflict
 	)
 	if err != nil {
 		t.Fatalf("could not start etcd process cluster (%v)", err)
@@ -97,7 +98,7 @@ func TestReleaseUpgrade(t *testing.T) {
 	// new cluster version needs more time to upgrade
 	ver := version.Cluster(version.Version)
 	for i := 0; i < 7; i++ {
-		if err = e2e.CURLGet(epc, e2e.CURLReq{Endpoint: "/version", Expected: `"etcdcluster":"` + ver}); err != nil {
+		if err = e2e.CURLGet(epc, e2e.CURLReq{Endpoint: "/version", Expected: expect.ExpectedResponse{Value: `"etcdcluster":"` + ver}}); err != nil {
 			t.Logf("#%d: %v is not ready yet (%v)", i, ver, err)
 			time.Sleep(time.Second)
 			continue
@@ -120,7 +121,7 @@ func TestReleaseUpgradeWithRestart(t *testing.T) {
 	epc, err := e2e.NewEtcdProcessCluster(context.TODO(), t,
 		e2e.WithVersion(e2e.LastVersion),
 		e2e.WithSnapshotCount(10),
-		e2e.WithBaseScheme("unix"),
+		e2e.WithBasePeerScheme("unix"),
 	)
 
 	if err != nil {

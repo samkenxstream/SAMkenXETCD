@@ -18,11 +18,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/coreos/go-semver/semver"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
+	"go.etcd.io/etcd/api/v3/version"
 	"go.etcd.io/etcd/client/pkg/v3/logutil"
 	"go.etcd.io/etcd/client/v3/credentials"
 	"go.etcd.io/etcd/client/v3/internal/endpoint"
@@ -68,7 +69,7 @@ type Client struct {
 	Username string
 	// Password is a password for authentication.
 	Password        string
-	authTokenBundle credentials.Bundle
+	authTokenBundle credentials.PerRPCCredentialsBundle
 
 	callOpts []grpc.CallOption
 
@@ -337,7 +338,7 @@ func (c *Client) credentialsForEndpoint(ep string) grpccredentials.TransportCred
 		if c.creds != nil {
 			return c.creds
 		}
-		return credentials.NewBundle(credentials.Config{}).TransportCredentials()
+		return credentials.NewTransportCredential(nil)
 	default:
 		panic(fmt.Errorf("unsupported CredsRequirement: %v", r))
 	}
@@ -349,7 +350,7 @@ func newClient(cfg *Config) (*Client, error) {
 	}
 	var creds grpccredentials.TransportCredentials
 	if cfg.TLS != nil {
-		creds = credentials.NewBundle(credentials.Config{TLSConfig: cfg.TLS}).TransportCredentials()
+		creds = credentials.NewTransportCredential(cfg.TLS)
 	}
 
 	// use a temporary skeleton client to bootstrap first connection
@@ -388,7 +389,7 @@ func newClient(cfg *Config) (*Client, error) {
 	if cfg.Username != "" && cfg.Password != "" {
 		client.Username = cfg.Username
 		client.Password = cfg.Password
-		client.authTokenBundle = credentials.NewBundle(credentials.Config{})
+		client.authTokenBundle = credentials.NewPerRPCCredentialBundle()
 	}
 	if cfg.MaxCallSendMsgSize > 0 || cfg.MaxCallRecvMsgSize > 0 {
 		if cfg.MaxCallRecvMsgSize > 0 && cfg.MaxCallSendMsgSize > cfg.MaxCallRecvMsgSize {
@@ -475,6 +476,22 @@ func (c *Client) roundRobinQuorumBackoff(waitBetween time.Duration, jitterFracti
 	}
 }
 
+// minSupportedVersion returns the minimum version supported, which is the previous minor release.
+func minSupportedVersion() *semver.Version {
+	ver := semver.Must(semver.NewVersion(version.Version))
+	// consider only major and minor version
+	ver = &semver.Version{Major: ver.Major, Minor: ver.Minor}
+	for i := range version.AllVersions {
+		if version.AllVersions[i].Equal(*ver) {
+			if i == 0 {
+				return ver
+			}
+			return &version.AllVersions[i-1]
+		}
+	}
+	panic("current version is not in the version list")
+}
+
 func (c *Client) checkVersion() (err error) {
 	var wg sync.WaitGroup
 
@@ -496,20 +513,13 @@ func (c *Client) checkVersion() (err error) {
 				errc <- rerr
 				return
 			}
-			vs := strings.Split(resp.Version, ".")
-			maj, min := 0, 0
-			if len(vs) >= 2 {
-				var serr error
-				if maj, serr = strconv.Atoi(vs[0]); serr != nil {
-					errc <- serr
-					return
-				}
-				if min, serr = strconv.Atoi(vs[1]); serr != nil {
-					errc <- serr
-					return
-				}
+			vs, serr := semver.NewVersion(resp.Version)
+			if serr != nil {
+				errc <- serr
+				return
 			}
-			if maj < 3 || (maj == 3 && min < 4) {
+
+			if vs.LessThan(*minSupportedVersion()) {
 				rerr = ErrOldCluster
 			}
 			errc <- rerr
